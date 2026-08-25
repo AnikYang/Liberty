@@ -8,7 +8,7 @@ Liberty does not ship a .NET, Python, Node, Qt, or other runtime. The release ex
 
 ## Features
 
-- Windows 11-inspired custom tray popup: rounded/DWM-aware presentation, larger readable spacing, hover states, keyboard navigation, per-monitor DPI scaling, light/dark theme, and Windows 10 fallback.
+- Compact Windows 11-inspired custom tray popup: the root view is capped at roughly one third of the work area, with Shortcuts / System maintenance / Status bar / Other submenus. The Trinity logo and Liberty title stay in a fixed, clipped header while submenu content scrolls underneath without text overlap.
 - Uses `Segoe UI Variable Text` / `Segoe UI Variable Display` with a Windows 10 fallback so Chinese and English controls remain readable on high-resolution displays.
 - 简体中文 / English switching. The default follows the Windows UI language and the selected language is saved per user.
 - Cmd / Option / Control physical-key mapping. Choose left/right Windows, Alt, Control, or Caps Lock; mappings must remain distinct.
@@ -18,7 +18,7 @@ Liberty does not ship a .NET, Python, Node, Qt, or other runtime. The release ex
 - OneDrive auto-start blocking that backs up and restores the current-user Run value, StartupApproved bytes, matching Startup-folder shortcuts, and the `OneDrive Startup Task-*` login tasks. It does not disable OneDrive update/reporting tasks or delete synced data.
 - Reversible NVIDIA and AMD panel startup-entry hiding. Driver services are never stopped.
 - Windows Security tray-entry hiding via the documented `HideSystray` policy. Defender, real-time protection, and security services remain enabled.
-- Desktop image overlay using Windows Imaging Component: PNG, JPEG, BMP, GIF, TIFF, and ICO; topmost display, drag, wheel zoom, opacity, lock, mouse passthrough, and saved restoration.
+- Desktop image overlay using Windows Imaging Component: PNG, JPEG, BMP, GIF, TIFF, and ICO; an always-on-top layered window, drag, wheel zoom, opacity, lock, mouse passthrough, display-change refresh, and saved restoration. The overlay path can also be loaded with the internal `--overlay <path>` diagnostic entry point.
 - Windows Empty Volume Cache scan in a resizable, DPI-aware window. Low-risk cache categories are selected by default; Downloads, Windows.old, driver packages, ESD, rollback, and other advanced categories require explicit selection and a second confirmation. No registry cleaning and no Documents/OneDrive deletion.
 
 ## Trinity brand
@@ -86,7 +86,7 @@ This project is released under the [MIT License](LICENSE). The overlay interacti
 
 ## Liberty（中文说明）
 
-Liberty 是面向 Windows 10/11 x64 的原生 C++/Win32 便携工具。右键托盘图标可以打开更大、更易读的 Windows 11 风格菜单，并在中文和 English 之间切换。工具包含快捷键映射、定时关机、桌面截图保存、启动项管理、OneDrive 自动启动阻止、NVIDIA/AMD 面板启动隐藏、Windows Security 托盘入口隐藏、桌面图片悬浮，以及基于 Windows 内置清理处理器的 DPI 自适应缓存清理窗口。
+Liberty 是面向 Windows 10/11 x64 的原生 C++/Win32 便携工具。右键托盘图标可以打开紧凑的 Windows 11 风格菜单，按“快捷键、系统维护、状态栏、其他”分组，并在中文和 English 之间切换。工具包含快捷键映射、定时关机、桌面截图保存、启动项管理、OneDrive 自动启动阻止、NVIDIA/AMD 面板启动隐藏、Windows Security 托盘入口隐藏、桌面图片悬浮，以及基于 Windows 内置清理处理器的 DPI 自适应缓存清理窗口。
 
 启动项管理会扫描 Run/RunOnce/RunOnceEx、旧式 run/load、启动文件夹、登录任务和自动启动服务。它会标记启动器、更新器、脚本、重复唤醒链、临时目录和常见第三方后台助手；“选择风险项”只做选择，不会自动禁用，确认后才会执行。系统保护项保持只读，所有实际修改都支持恢复。
 

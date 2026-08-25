@@ -206,6 +206,7 @@ std::vector<CleanupItem> g_cleanupItems;
 int g_menuHover = -1;
 int g_menuSelected = -1;
 int g_menuScroll = 0;
+DWORD g_lastTrayMenuEventTick = 0;
 
 constexpr ModifierChoice kModifierChoices[] = {
     {VK_LWIN, L"Left Windows", L"左 Windows"},
@@ -1502,7 +1503,7 @@ LRESULT CALLBACK AboutProc(HWND window, UINT message, WPARAM wParam, LPARAM) {
     if (message == WM_COMMAND && LOWORD(wParam) == IDOK) { DestroyWindow(window); return 0; }
     if (message == WM_PAINT) {
         PAINTSTRUCT paint{}; HDC hdc = BeginPaint(window, &paint); RECT logo{24, 24, 126, 126}; DrawTrinityLogo(hdc, logo, true); RECT title{150, 28, 385, 64}; SetBkMode(hdc, TRANSPARENT); SetTextColor(hdc, IsDarkTheme() ? RGB(245, 245, 250) : RGB(25, 25, 35)); HFONT font = CreateFontW(26, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI"); HFONT old = static_cast<HFONT>(SelectObject(hdc, font)); DrawTextW(hdc, L"Liberty", -1, &title, DT_LEFT | DT_SINGLELINE | DT_VCENTER); SelectObject(hdc, old); DeleteObject(font);
-        RECT text{24, 140, 388, 236}; std::wstring about = L"Liberty 1.1.1\n\n"; about += T(L"Trinity mark: freedom, control, and focus.", L"Trinity 标志：自由、控制与专注。\n"); about += L"\nCmd = "; about += ModifierLabel(g_commandKey); about += L"\nOption = "; about += ModifierLabel(g_optionKey); about += L"\nControl = "; about += ModifierLabel(g_controlKey); SetTextColor(hdc, IsDarkTheme() ? RGB(205, 207, 220) : RGB(70, 70, 85)); DrawTextW(hdc, about.c_str(), -1, &text, DT_LEFT | DT_WORDBREAK); EndPaint(window, &paint); return 0;
+        RECT text{24, 140, 388, 236}; std::wstring about = L"Liberty 1.1.2\n\n"; about += T(L"Trinity mark: freedom, control, and focus.", L"Trinity 标志：自由、控制与专注。\n"); about += L"\nCmd = "; about += ModifierLabel(g_commandKey); about += L"\nOption = "; about += ModifierLabel(g_optionKey); about += L"\nControl = "; about += ModifierLabel(g_controlKey); SetTextColor(hdc, IsDarkTheme() ? RGB(205, 207, 220) : RGB(70, 70, 85)); DrawTextW(hdc, about.c_str(), -1, &text, DT_LEFT | DT_WORDBREAK); EndPaint(window, &paint); return 0;
     }
     if (message == WM_CLOSE) { DestroyWindow(window); return 0; }
     if (message == WM_DESTROY && g_aboutWindow == window) g_aboutWindow = nullptr;
@@ -1568,6 +1569,17 @@ void ShowModernMenu(HWND owner) {
     const std::vector<MenuRow> rows = BuildMenuRows(); POINT cursor{}; GetCursorPos(&cursor); HMONITOR monitor = MonitorFromPoint(cursor, MONITOR_DEFAULTTONEAREST); MONITORINFO info{sizeof(info)}; GetMonitorInfoW(monitor, &info); constexpr int width = 420; const int height = (std::min)(MenuTotalHeight(rows), static_cast<int>(info.rcWork.bottom - info.rcWork.top - 18)); int x = cursor.x, y = cursor.y - height; if (x + width > info.rcWork.right) x = info.rcWork.right - width - 6; if (x < info.rcWork.left) x = info.rcWork.left + 6; if (y < info.rcWork.top) y = info.rcWork.top + 6; g_menuScroll = 0; g_menuHover = -1; g_menuSelected = -1; g_menuWindow = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST, kMenuClass, kAppName, WS_POPUP | WS_BORDER, x, y, width, height, owner, nullptr, g_instance, nullptr); if (!g_menuWindow) return; ShowWindow(g_menuWindow, SW_SHOWNORMAL); SetForegroundWindow(g_menuWindow); SetFocus(g_menuWindow); SetCapture(g_menuWindow); UpdateWindow(g_menuWindow);
 }
 
+void HandleTrayMenuEvent(HWND window, UINT event) {
+    const DWORD now = GetTickCount();
+    // Explorer can report one physical right-click as both WM_RBUTTONUP and
+    // WM_CONTEXTMENU. Treat that pair as one invocation; otherwise the
+    // second notification immediately toggles the popup back off.
+    if (g_lastTrayMenuEventTick != 0 && now - g_lastTrayMenuEventTick < 300) return;
+    g_lastTrayMenuEventTick = now;
+    if (event == WM_CONTEXTMENU && g_menuWindow) return;
+    ShowModernMenu(window);
+}
+
 LRESULT CALLBACK MenuProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
     static std::vector<MenuRow> rows;
     switch (message) {
@@ -1608,7 +1620,7 @@ bool RegisterClasses() {
         switch (message) {
         case WM_TIMER: if (wParam == kOneDriveRefreshTimer && g_blockOneDrive) ApplyOneDriveBlock(true, false); return 0;
         case WM_HOTKEY: if (wParam == 1) { g_enabled = !g_enabled; SaveDword(L"Enabled", g_enabled ? 1 : 0); ResetMappedModifierState(); RefreshTrayIcon(); } if (wParam == 2) ScreenOff(); if (wParam == 3) ScheduleShutdown(60 * 60); if (wParam == 4) CancelShutdown(); return 0;
-        case kTrayMessage: if (LOWORD(lParam) == WM_LBUTTONUP) { g_enabled = !g_enabled; SaveDword(L"Enabled", g_enabled ? 1 : 0); ResetMappedModifierState(); RefreshTrayIcon(); } if (LOWORD(lParam) == WM_RBUTTONUP || LOWORD(lParam) == WM_CONTEXTMENU) ShowModernMenu(window); return 0;
+        case kTrayMessage: { const UINT trayEvent = LOWORD(lParam); if (trayEvent == WM_LBUTTONUP) { g_enabled = !g_enabled; SaveDword(L"Enabled", g_enabled ? 1 : 0); ResetMappedModifierState(); RefreshTrayIcon(); } else if (trayEvent == WM_RBUTTONUP || trayEvent == WM_CONTEXTMENU) HandleTrayMenuEvent(window, trayEvent); return 0; }
         case WM_SETTINGCHANGE: if (g_menuWindow) InvalidateRect(g_menuWindow, nullptr, TRUE); return 0;
         case WM_DESTROY: KillTimer(window, kOneDriveRefreshTimer); ResetMappedModifierState(); UnregisterHotKey(window, 1); UnregisterHotKey(window, 2); UnregisterHotKey(window, 3); UnregisterHotKey(window, 4); if (g_hook) { UnhookWindowsHookEx(g_hook); g_hook = nullptr; } CloseOverlay(); if (g_cleanupWindow) DestroyWindow(g_cleanupWindow); if (g_aboutWindow) DestroyWindow(g_aboutWindow); Shell_NotifyIconW(NIM_DELETE, &g_tray); if (g_tray.hIcon) { DestroyIcon(g_tray.hIcon); g_tray.hIcon = nullptr; } PostQuitMessage(0); return 0;
         }

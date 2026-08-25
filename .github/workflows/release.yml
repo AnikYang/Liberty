@@ -1,0 +1,40 @@
+name: Release Liberty
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: cmake -S . -B build -A x64
+      - name: Build Release x64
+        run: cmake --build build --config Release --parallel
+      - name: Prepare portable package
+        shell: pwsh
+        run: |
+          Copy-Item build/Release/Liberty.exe Liberty.exe -Force
+          $hash = (Get-FileHash Liberty.exe -Algorithm SHA256).Hash
+          "$hash  Liberty.exe" | Set-Content SHA256SUMS.txt -Encoding ascii
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Liberty-Windows-x64-${{ github.ref_name }}
+          path: |
+            Liberty.exe
+            SHA256SUMS.txt
+            assets/liberty-trinity.svg
+            assets/liberty-trinity-mono.svg
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$env:GITHUB_REF_NAME" Liberty.exe SHA256SUMS.txt assets/liberty-trinity.svg assets/liberty-trinity-mono.svg --title "Liberty $env:GITHUB_REF_NAME" --generate-notes

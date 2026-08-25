@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-labelledby="title desc">
+  <title id="title">Liberty Trinity</title>
+  <desc id="desc">Three interwoven rounded ribbons forming a balanced central aperture.</desc>
+  <defs>
+    <linearGradient id="trinity" x1="34" y1="30" x2="222" y2="226" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#4F8CFF"/>
+      <stop offset="0.5" stop-color="#635BFF"/>
+      <stop offset="1" stop-color="#20C7D9"/>
+    </linearGradient>
+  </defs>
+  <g fill="none" stroke="url(#trinity)" stroke-width="22" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M128 31 C181 31 218 67 218 114 C218 166 180 207 128 225"/>
+    <path d="M225 128 C225 181 189 218 142 218 C90 218 49 180 31 128"/>
+    <path d="M128 225 C75 225 38 189 38 142 C38 90 76 49 128 31"/>
+  </g>
+  <path d="M128 83 L166 105 L166 151 L128 173 L90 151 L90 105 Z" fill="#0B1020" fill-opacity="0.12"/>
+</svg>

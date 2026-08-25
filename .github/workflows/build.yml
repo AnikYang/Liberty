@@ -1,0 +1,26 @@
+name: Build Liberty
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ["main"]
+    tags: ["v*"]
+
+jobs:
+  windows:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: cmake -S . -B build -A x64
+      - name: Build
+        run: cmake --build build --config Release
+      - name: Copy portable executable
+        shell: pwsh
+        run: Copy-Item build/Release/Liberty.exe Liberty.exe -Force
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Liberty-Windows-x64
+          path: |
+            build/Release/Liberty.exe
+            Liberty.exe

@@ -8,15 +8,17 @@ Liberty does not ship a .NET, Python, Node, Qt, or other runtime. The release ex
 
 ## Features
 
-- Windows 11-inspired custom tray popup: rounded/DWM-aware presentation, hover states, keyboard navigation, DPI-aware placement, light/dark theme, and Windows 10 fallback.
+- Windows 11-inspired custom tray popup: rounded/DWM-aware presentation, larger readable spacing, hover states, keyboard navigation, per-monitor DPI scaling, light/dark theme, and Windows 10 fallback.
+- Uses `Segoe UI Variable Text` / `Segoe UI Variable Display` with a Windows 10 fallback so Chinese and English controls remain readable on high-resolution displays.
 - 简体中文 / English switching. The default follows the Windows UI language and the selected language is saved per user.
 - Cmd / Option / Control physical-key mapping. Choose left/right Windows, Alt, Control, or Caps Lock; mappings must remain distinct.
 - Custom shutdown from 1–10080 minutes with input focus, validation, Enter confirmation, and Esc cancellation.
+- Full virtual-desktop screenshot capture saved as a timestamped PNG on the Desktop, including multi-monitor layouts.
 - OneDrive auto-start blocking that backs up and restores the current-user Run value, StartupApproved bytes, matching Startup-folder shortcuts, and the `OneDrive Startup Task-*` login tasks. It does not disable OneDrive update/reporting tasks or delete synced data.
 - Reversible NVIDIA and AMD panel startup-entry hiding. Driver services are never stopped.
 - Windows Security tray-entry hiding via the documented `HideSystray` policy. Defender, real-time protection, and security services remain enabled.
 - Desktop image overlay using Windows Imaging Component: PNG, JPEG, BMP, GIF, TIFF, and ICO; topmost display, drag, wheel zoom, opacity, lock, mouse passthrough, and saved restoration.
-- Windows Empty Volume Cache scan. Low-risk cache categories are selected by default; Downloads, Windows.old, driver packages, ESD, rollback, and other advanced categories require explicit selection and a second confirmation. No registry cleaning and no Documents/OneDrive deletion.
+- Windows Empty Volume Cache scan in a resizable, DPI-aware window. Low-risk cache categories are selected by default; Downloads, Windows.old, driver packages, ESD, rollback, and other advanced categories require explicit selection and a second confirmation. No registry cleaning and no Documents/OneDrive deletion.
 
 ## Trinity brand
 
@@ -77,7 +79,7 @@ This project is released under the [MIT License](LICENSE). The overlay interacti
 
 ## Liberty（中文说明）
 
-Liberty 是面向 Windows 10/11 x64 的原生 C++/Win32 便携工具。右键托盘图标可以打开 Windows 11 风格菜单，并在中文和 English 之间切换。工具包含快捷键映射、定时关机、OneDrive 自动启动阻止、NVIDIA/AMD 面板启动隐藏、Windows Security 托盘入口隐藏、桌面图片悬浮，以及基于 Windows 内置清理处理器的缓存清理。
+Liberty 是面向 Windows 10/11 x64 的原生 C++/Win32 便携工具。右键托盘图标可以打开更大、更易读的 Windows 11 风格菜单，并在中文和 English 之间切换。工具包含快捷键映射、定时关机、桌面截图保存、OneDrive 自动启动阻止、NVIDIA/AMD 面板启动隐藏、Windows Security 托盘入口隐藏、桌面图片悬浮，以及基于 Windows 内置清理处理器的 DPI 自适应缓存清理窗口。
 
 OneDrive 功能只处理当前用户的启动入口和登录任务，并保存原始状态以便恢复；不会删除同步文件，不会关闭更新任务，也不会覆盖企业策略。清理功能默认只选择低风险缓存，高风险项目必须手动勾选并二次确认，不清理注册表、不删除 Documents 或 OneDrive 文件。
 

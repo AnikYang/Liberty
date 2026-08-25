@@ -20,6 +20,7 @@
 #include <shellscalingapi.h>
 #include <taskschd.h>
 #include <tlhelp32.h>
+#include <uxtheme.h>
 #include <wincodec.h>
 #include <windowsx.h>
 
@@ -175,6 +176,7 @@ struct MenuRow {
     bool checked = false;
     bool enabled = true;
     MenuIcon icon = MenuIcon::None;
+    bool nativeToggle = false;
 };
 
 struct OverlayState {
@@ -280,6 +282,7 @@ DWORD g_lastTrayMenuEventTick = 0;
 MenuPage g_menuPage = MenuPage::Root;
 DWORD g_menuSlideStart = 0;
 int g_menuSlideDirection = 1;
+HFONT g_menuControlFont = nullptr;
 bool g_autoSaveScreenshots = false;
 bool g_screenshotCaptureArmed = false;
 DWORD g_screenshotArmTick = 0;
@@ -1018,9 +1021,23 @@ bool CaptureDesktopScreenshot() {
 
     HDC screen = GetDC(nullptr);
     HDC memory = CreateCompatibleDC(screen);
-    HBITMAP bitmap = CreateCompatibleBitmap(screen, width, height);
-    if (!screen || !memory || !bitmap || !BitBlt(memory, 0, 0, width, height, screen, left, top,
-                                                  SRCCOPY | CAPTUREBLT)) {
+    BITMAPINFO info{};
+    info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    info.bmiHeader.biWidth = width;
+    info.bmiHeader.biHeight = -height;
+    info.bmiHeader.biPlanes = 1;
+    info.bmiHeader.biBitCount = 32;
+    info.bmiHeader.biCompression = BI_RGB;
+    void* pixels = nullptr;
+    HBITMAP bitmap = screen ? CreateDIBSection(screen, &info, DIB_RGB_COLORS, &pixels, nullptr, 0) : nullptr;
+    HBITMAP previous = nullptr;
+    bool copied = false;
+    if (screen && memory && bitmap && pixels) {
+        previous = static_cast<HBITMAP>(SelectObject(memory, bitmap));
+        copied = BitBlt(memory, 0, 0, width, height, screen, left, top, SRCCOPY) != FALSE;
+        SelectObject(memory, previous);
+    }
+    if (!screen || !memory || !bitmap || !copied) {
         if (bitmap) DeleteObject(bitmap);
         if (memory) DeleteDC(memory);
         if (screen) ReleaseDC(nullptr, screen);
@@ -1043,11 +1060,16 @@ bool CaptureDesktopScreenshot() {
     for (int suffix = 2; GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES; ++suffix)
         path = desktop + L"\\" + stem + L" (" + std::to_wstring(suffix) + L").png";
 
-    CLSID pngClsid{};
     bool saved = false;
-    if (FindImageEncoder(L"image/png", &pngClsid) >= 0) {
-        Gdiplus::Bitmap image(bitmap, nullptr);
-        saved = image.Save(path.c_str(), &pngClsid, nullptr) == Gdiplus::Ok;
+    if (pixels) {
+        auto* bgra = reinterpret_cast<BYTE*>(pixels);
+        for (size_t index = 0; index < static_cast<size_t>(width) * height; ++index) bgra[index * 4 + 3] = 255;
+        CLSID pngClsid{};
+        if (FindImageEncoder(L"image/png", &pngClsid) >= 0) {
+            Gdiplus::Bitmap image(width, height, width * 4, PixelFormat32bppPARGB,
+                                  reinterpret_cast<BYTE*>(pixels));
+            saved = image.Save(path.c_str(), &pngClsid, nullptr) == Gdiplus::Ok;
+        }
     }
     DeleteObject(bitmap);
     DeleteDC(memory);
@@ -2921,7 +2943,7 @@ LRESULT CALLBACK AboutProc(HWND window, UINT message, WPARAM wParam, LPARAM lPar
         DrawTextW(hdc, kAppName, -1, &title, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
         SelectObject(hdc, old); DeleteObject(font);
         RECT text{ScaleUi(28, dpi), ScaleUi(156, dpi), ScaleUi(480, dpi), ScaleUi(278, dpi)};
-        std::wstring about = L"Liberty by Bada 1.4.0\n\n";
+        std::wstring about = L"Liberty by Bada 0.1.1\n\n";
         about += T(L"Trinity mark: freedom, control, and focus.", L"Trinity 标志：自由、控制与专注。\n");
         about += L"\nCmd = "; about += ModifierLabel(g_commandKey);
         about += L"\nOption = "; about += ModifierLabel(g_optionKey);
@@ -2947,6 +2969,11 @@ void SetDarkMode(HWND window, bool dark) {
 void AddMenuHeader(std::vector<MenuRow>& rows, const wchar_t* english, const wchar_t* chinese) { rows.push_back({MenuRow::Header, 0, T(english, chinese), {}, false, true}); }
 
 void AddMenuAction(std::vector<MenuRow>& rows, UINT id, const wchar_t* english, const wchar_t* chinese, bool checked = false, bool enabled = true, const std::wstring& detail = {}) { rows.push_back({MenuRow::Action, id, T(english, chinese), detail, checked, enabled}); }
+
+void AddMenuToggle(std::vector<MenuRow>& rows, UINT id, const wchar_t* english, const wchar_t* chinese,
+                   bool checked, bool enabled = true) {
+    rows.push_back({MenuRow::Action, id, T(english, chinese), {}, checked, enabled, MenuIcon::None, true});
+}
 
 void AddMenuCategory(std::vector<MenuRow>& rows, UINT id, const wchar_t* english, const wchar_t* chinese,
                      const wchar_t* englishDetail, const wchar_t* chineseDetail, MenuIcon icon) {
@@ -2977,10 +3004,13 @@ std::vector<MenuRow> BuildMenuRows(MenuPage page = MenuPage::Root) {
         AddMenuAction(rows, ID_HIDE_AMD, L"Hide AMD panel startup", L"隐藏 AMD 面板启动", g_hideAmdPanel);
         AddMenuAction(rows, ID_HIDE_SECURITY, L"Hide Windows Security tray entry", L"隐藏 Windows Security 托盘入口", g_hideSecurityCenter);
     } else if (page == MenuPage::Status) {
-        rows.push_back({MenuRow::Status, 0, T(L"Shortcuts", L"快捷键"), g_enabled ? T(L"Enabled", L"已启用") : T(L"Paused", L"已暂停"), false, true});
-        rows.push_back({MenuRow::Status, 0, T(L"Windows startup", L"Windows 启动"), g_startAtLogin ? T(L"Enabled", L"已启用") : T(L"Disabled", L"未启用"), false, true});
-        rows.push_back({MenuRow::Status, 0, T(L"OneDrive", L"OneDrive"), g_blockOneDrive ? T(L"Auto-start blocked", L"已阻止自动启动") : T(L"Not blocked", L"未阻止"), false, true});
-        rows.push_back({MenuRow::Status, 0, T(L"Floating image", L"悬浮图片"), g_overlayWindow ? T(L"Visible", L"显示中") : T(L"Not open", L"未打开"), false, true});
+        AddMenuToggle(rows, ID_TOGGLE, L"Shortcuts enabled", L"快捷键已启用", g_enabled);
+        AddMenuToggle(rows, ID_STARTUP, L"Start Liberty with Windows", L"随 Windows 启动", g_startAtLogin);
+        AddMenuToggle(rows, ID_SCREENSHOT_AUTOSAVE, L"Auto-save Windows screenshots", L"自动保存 Windows 截图", g_autoSaveScreenshots);
+        AddMenuToggle(rows, ID_BLOCK_ONEDRIVE, L"Block OneDrive auto-start", L"阻止 OneDrive 自动启动", g_blockOneDrive);
+        AddMenuToggle(rows, ID_HIDE_NVIDIA, L"Hide NVIDIA panel startup", L"隐藏 NVIDIA 面板启动", g_hideNvidiaPanel);
+        AddMenuToggle(rows, ID_HIDE_AMD, L"Hide AMD panel startup", L"隐藏 AMD 面板启动", g_hideAmdPanel);
+        AddMenuToggle(rows, ID_HIDE_SECURITY, L"Hide Windows Security tray entry", L"隐藏 Windows Security 托盘入口", g_hideSecurityCenter);
     } else if (page == MenuPage::Other) {
         AddMenuCategory(rows, ID_MENU_OVERLAY, L"Floating image", L"桌面图片悬浮", L"Open, paste and control an overlay", L"打开、粘贴并控制悬浮图片", MenuIcon::Image);
         AddMenuAction(rows, ID_MENU_LANGUAGE, g_language == AppLanguage::Chinese ? L"Switch to English" : L"切换到简体中文", g_language == AppLanguage::Chinese ? L"切换到 English" : L"切换到简体中文");
@@ -3190,6 +3220,50 @@ void RefreshModernMenu() {
     if (g_menuWindow) PostMessageW(g_menuWindow, kMenuRebuild, 0, 0);
 }
 
+void ClearMenuNativeControls(HWND window) {
+    HWND child = GetWindow(window, GW_CHILD);
+    while (child) {
+        HWND next = GetWindow(child, GW_HWNDNEXT);
+        DestroyWindow(child);
+        child = next;
+    }
+    if (g_menuControlFont) { DeleteObject(g_menuControlFont); g_menuControlFont = nullptr; }
+}
+
+void LayoutMenuNativeControls(HWND window, const std::vector<MenuRow>& rows, UINT dpi) {
+    if (g_menuPage != MenuPage::Status) return;
+    RECT client{}; GetClientRect(window, &client);
+    int current = MenuTopHeight(dpi) - g_menuScroll;
+    for (const MenuRow& row : rows) {
+        const int rowHeight = MenuRowHeight(row, dpi);
+        if (row.nativeToggle) {
+            HWND toggle = GetDlgItem(window, row.id);
+            if (toggle) MoveWindow(toggle, ScaleUi(18, dpi), current + ScaleUi(4, dpi),
+                                   client.right - ScaleUi(36, dpi), rowHeight - ScaleUi(8, dpi), TRUE);
+        }
+        current += rowHeight;
+    }
+}
+
+void CreateMenuNativeControls(HWND window, const std::vector<MenuRow>& rows, UINT dpi) {
+    ClearMenuNativeControls(window);
+    if (g_menuPage != MenuPage::Status) return;
+    g_menuControlFont = CreateUiFont(window, 15, FW_MEDIUM);
+    for (const MenuRow& row : rows) {
+        if (!row.nativeToggle) continue;
+        HWND toggle = CreateWindowExW(0, L"BUTTON", row.label.c_str(),
+                                      WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX | BS_RIGHTBUTTON,
+                                      0, 0, 0, 0, window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(row.id)), g_instance, nullptr);
+        if (toggle) {
+            SetWindowTheme(toggle, L"Explorer", nullptr);
+            SendMessageW(toggle, WM_SETFONT, reinterpret_cast<WPARAM>(g_menuControlFont), TRUE);
+            Button_SetCheck(toggle, row.checked ? BST_CHECKED : BST_UNCHECKED);
+            EnableWindow(toggle, row.enabled);
+        }
+    }
+    LayoutMenuNativeControls(window, rows, dpi);
+}
+
 void HandleTrayMenuEvent(HWND window, UINT event) {
     const DWORD now = GetTickCount();
     // Explorer can report one physical right-click as both WM_RBUTTONUP and
@@ -3244,6 +3318,7 @@ LRESULT CALLBACK MenuProc(HWND window, UINT message, WPARAM wParam, LPARAM lPara
     case WM_CREATE:
         SetDarkMode(window, IsDarkTheme());
         rows = BuildMenuRows(g_menuPage);
+        CreateMenuNativeControls(window, rows, dpi);
         return 0;
     case kMenuRebuild:
         rows = BuildMenuRows(g_menuPage);
@@ -3252,13 +3327,18 @@ LRESULT CALLBACK MenuProc(HWND window, UINT message, WPARAM wParam, LPARAM lPara
         g_menuSelected = -1;
         g_menuSlideStart = GetTickCount();
         SetTimer(window, kMenuAnimationTimer, 16, nullptr);
+        CreateMenuNativeControls(window, rows, dpi);
         SetCapture(window);
         SetFocus(window);
         InvalidateRect(window, nullptr, TRUE);
         return 0;
     case WM_DPICHANGED:
         SetDarkMode(window, IsDarkTheme());
+        CreateMenuNativeControls(window, rows, dpi);
         InvalidateRect(window, nullptr, TRUE);
+        return 0;
+    case WM_SIZE:
+        LayoutMenuNativeControls(window, rows, dpi);
         return 0;
     case WM_PAINT: {
         PAINTSTRUCT paint{};
@@ -3324,7 +3404,7 @@ LRESULT CALLBACK MenuProc(HWND window, UINT message, WPARAM wParam, LPARAM lPara
                     RECT detail{ScaleUi(20, dpi), rowRect.top + ScaleUi(30, dpi), rowRect.right - ScaleUi(18, dpi), rowRect.bottom};
                     DrawTextW(buffer, row.detail.c_str(), -1, &detail, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
                     SelectObject(buffer, old); DeleteObject(detailFont);
-                } else if (row.kind == MenuRow::Action || row.kind == MenuRow::Category) {
+                } else if ((row.kind == MenuRow::Action || row.kind == MenuRow::Category) && !row.nativeToggle) {
                     if (static_cast<int>(index) == g_menuHover || static_cast<int>(index) == g_menuSelected) {
                         HBRUSH hover = CreateSolidBrush(dark ? RGB(55, 58, 72) : RGB(231, 236, 248));
                         HPEN pen = CreatePen(PS_NULL, 0, 0);
@@ -3413,9 +3493,17 @@ LRESULT CALLBACK MenuProc(HWND window, UINT message, WPARAM wParam, LPARAM lPara
         GetClientRect(window, &client);
         const int maxScroll = (std::max)(0, MenuTotalHeight(rows, dpi) - static_cast<int>(client.bottom));
         g_menuScroll = std::clamp(g_menuScroll - GET_WHEEL_DELTA_WPARAM(wParam) / 2, 0, maxScroll);
+        LayoutMenuNativeControls(window, rows, dpi);
         InvalidateRect(window, nullptr, FALSE);
         return 0;
     }
+    case WM_COMMAND:
+        if (HIWORD(wParam) == BN_CLICKED && g_menuPage == MenuPage::Status) {
+            ExecuteCommand(LOWORD(wParam));
+            RefreshModernMenu();
+            return 0;
+        }
+        break;
     case WM_MOUSEACTIVATE: return MA_ACTIVATE;
     case WM_LBUTTONDOWN: {
         RECT client{}; GetClientRect(window, &client);
@@ -3463,6 +3551,7 @@ LRESULT CALLBACK MenuProc(HWND window, UINT message, WPARAM wParam, LPARAM lPara
     case WM_SETTINGCHANGE: SetDarkMode(window, IsDarkTheme()); InvalidateRect(window, nullptr, TRUE); return 0;
     case WM_NCDESTROY:
         KillTimer(window, kMenuAnimationTimer);
+        ClearMenuNativeControls(window);
         if (GetCapture() == window) ReleaseCapture();
         if (g_menuWindow == window) g_menuWindow = nullptr;
         return DefWindowProcW(window, message, wParam, lParam);

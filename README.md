@@ -4,6 +4,8 @@
 
 Liberty by Bada is a portable native C++/Win32 utility for Windows 10/11 x64. It combines macOS-style keyboard muscle memory, a modern tray menu, reversible startup controls, a desktop image pin, and a conservative Windows cleanup scanner in one `Liberty.exe`.
 
+Current release: `0.1.1`.
+
 Liberty does not ship a .NET, Python, Node, Qt, or other runtime. The release executable is built with the static MSVC runtime and uses documented Windows APIs.
 
 ## Features

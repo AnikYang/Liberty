@@ -45,7 +45,8 @@
 
 namespace {
 
-constexpr wchar_t kAppName[] = L"Liberty";
+constexpr wchar_t kAppName[] = L"Liberty by Bada";
+constexpr wchar_t kLegacyAppName[] = L"Liberty";
 constexpr wchar_t kWindowClass[] = L"Liberty.TrayWindow";
 constexpr wchar_t kMenuClass[] = L"Liberty.ModernMenu";
 constexpr wchar_t kOverlayClass[] = L"Liberty.ImageOverlay";
@@ -70,6 +71,7 @@ constexpr UINT kCleanupRunComplete = WM_APP + 4;
 constexpr UINT kStartupScanComplete = WM_APP + 6;
 constexpr UINT kStartupApplyComplete = WM_APP + 7;
 constexpr UINT kMenuRebuild = WM_APP + 8;
+constexpr UINT_PTR kMenuAnimationTimer = 9;
 constexpr UINT_PTR kOneDriveRefreshTimer = 5;
 constexpr ULONG_PTR kInjectedMarker = 0x4C494245525459ULL;
 
@@ -77,6 +79,8 @@ enum Command : UINT {
     ID_TOGGLE = 100,
     ID_SCREEN_OFF,
     ID_SCREENSHOT_DESKTOP,
+    ID_SCREENSHOT_SNIP_TO_DESKTOP,
+    ID_SCREENSHOT_AUTOSAVE,
     ID_SHUTDOWN_15,
     ID_SHUTDOWN_30,
     ID_SHUTDOWN_60,
@@ -91,12 +95,16 @@ enum Command : UINT {
     ID_MENU_MAINTENANCE,
     ID_MENU_STATUS,
     ID_MENU_OTHER,
+    ID_MENU_POWER,
+    ID_MENU_SCREENSHOTS,
+    ID_MENU_OVERLAY,
     ID_MENU_BACK,
     ID_BLOCK_ONEDRIVE,
     ID_HIDE_NVIDIA,
     ID_HIDE_AMD,
     ID_HIDE_SECURITY,
     ID_OVERLAY_OPEN,
+    ID_OVERLAY_PASTE,
     ID_OVERLAY_RESTORE,
     ID_OVERLAY_LOCK,
     ID_OVERLAY_CLICKTHROUGH,
@@ -138,7 +146,8 @@ enum StartupControl : int {
 enum class AppLanguage : DWORD { English = 0, Chinese = 1, Auto = 2 };
 
 enum class ManagedStartupKind { Registry, StartupFolder, ScheduledTask, Service };
-enum class MenuPage { Root, Shortcuts, Maintenance, Status, Other };
+enum class MenuPage { Root, Shortcuts, Maintenance, Status, Other, Power, Screenshots, Overlay };
+enum class MenuIcon { None, Keyboard, Maintenance, Status, Other, Power, Screenshot, Image };
 
 struct ModifierChoice {
     WORD virtualKey;
@@ -165,6 +174,7 @@ struct MenuRow {
     std::wstring detail;
     bool checked = false;
     bool enabled = true;
+    MenuIcon icon = MenuIcon::None;
 };
 
 struct OverlayState {
@@ -268,6 +278,12 @@ int g_menuSelected = -1;
 int g_menuScroll = 0;
 DWORD g_lastTrayMenuEventTick = 0;
 MenuPage g_menuPage = MenuPage::Root;
+DWORD g_menuSlideStart = 0;
+int g_menuSlideDirection = 1;
+bool g_autoSaveScreenshots = false;
+bool g_screenshotCaptureArmed = false;
+DWORD g_screenshotArmTick = 0;
+DWORD g_lastClipboardSequence = 0;
 
 constexpr ModifierChoice kModifierChoices[] = {
     {VK_LWIN, L"Left Windows", L"左 Windows"},
@@ -949,7 +965,7 @@ HICON CreateTrinityIcon(bool active) {
 
 void UpdateTrayTip() {
     const wchar_t* state = g_enabled ? T(L"shortcuts enabled", L"快捷键已启用") : T(L"shortcuts paused", L"快捷键已暂停");
-    std::wstring tip = L"Liberty — ";
+    std::wstring tip = std::wstring(kAppName) + L" — ";
     tip += state;
     lstrcpynW(g_tray.szTip, tip.c_str(), ARRAYSIZE(g_tray.szTip));
     if (g_tray.hWnd) Shell_NotifyIconW(NIM_MODIFY, &g_tray);
@@ -1040,6 +1056,76 @@ bool CaptureDesktopScreenshot() {
     return saved;
 }
 
+std::wstring TimestampedPngPath(const std::wstring& directory, const wchar_t* prefix) {
+    SYSTEMTIME now{}; GetLocalTime(&now);
+    wchar_t name[160]{};
+    swprintf_s(name, L"%s %04u-%02u-%02u_%02u%02u%02u.png", prefix, now.wYear, now.wMonth,
+               now.wDay, now.wHour, now.wMinute, now.wSecond);
+    std::wstring path = directory + L"\\" + name;
+    for (int suffix = 2; GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES; ++suffix) {
+        swprintf_s(name, L"%s %04u-%02u-%02u_%02u%02u%02u (%d).png", prefix, now.wYear,
+                   now.wMonth, now.wDay, now.wHour, now.wMinute, now.wSecond, suffix);
+        path = directory + L"\\" + name;
+    }
+    return path;
+}
+
+bool SaveBitmapAsPng(HBITMAP bitmap, const std::wstring& path) {
+    if (!bitmap || path.empty()) return false;
+    CLSID pngClsid{};
+    if (FindImageEncoder(L"image/png", &pngClsid) < 0) return false;
+    Gdiplus::Bitmap image(bitmap, nullptr);
+    return image.GetLastStatus() == Gdiplus::Ok && image.Save(path.c_str(), &pngClsid, nullptr) == Gdiplus::Ok;
+}
+
+HBITMAP CopyClipboardBitmap() {
+    if (!IsClipboardFormatAvailable(CF_BITMAP) || !OpenClipboard(g_window)) return nullptr;
+    HBITMAP source = static_cast<HBITMAP>(GetClipboardData(CF_BITMAP));
+    HBITMAP copy = source ? static_cast<HBITMAP>(CopyImage(source, IMAGE_BITMAP, 0, 0,
+                                                           LR_CREATEDIBSECTION)) : nullptr;
+    CloseClipboard();
+    return copy;
+}
+
+bool SaveClipboardScreenshotToDesktop() {
+    HBITMAP bitmap = CopyClipboardBitmap();
+    if (!bitmap) return false;
+    const std::wstring desktop = GetKnownFolder(FOLDERID_Desktop);
+    const std::wstring path = TimestampedPngPath(desktop, L"Liberty Screenshot");
+    const bool saved = SaveBitmapAsPng(bitmap, path);
+    DeleteObject(bitmap);
+    if (saved) ShowTrayNotification(T(L"Windows screenshot saved to Desktop.", L"Windows 截图已保存到桌面。"));
+    return saved;
+}
+
+bool ClipboardOwnerLooksLikeSnippingTool() {
+    HWND owner = GetClipboardOwner();
+    if (!owner) return false;
+    DWORD processId = 0; GetWindowThreadProcessId(owner, &processId);
+    HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, processId);
+    if (!process) return false;
+    wchar_t path[MAX_PATH * 4]{}; DWORD size = ARRAYSIZE(path);
+    const bool read = QueryFullProcessImageNameW(process, 0, path, &size) != FALSE;
+    CloseHandle(process);
+    if (!read) return false;
+    const std::wstring executable(path, size);
+    return ContainsInsensitive(executable, L"SnippingTool.exe") ||
+           ContainsInsensitive(executable, L"ScreenClippingHost.exe") ||
+           ContainsInsensitive(executable, L"ShellExperienceHost.exe");
+}
+
+void StartWindowsSnippingToDesktop() {
+    g_screenshotCaptureArmed = true;
+    g_screenshotArmTick = GetTickCount();
+    const HINSTANCE launched = ShellExecuteW(nullptr, L"open", L"ms-screenclip:", nullptr, nullptr, SW_SHOWNORMAL);
+    if (reinterpret_cast<INT_PTR>(launched) <= 32) {
+        SendKey(VK_LWIN, true); SendKey(VK_SHIFT, true); TapKey('S');
+        SendKey(VK_SHIFT, false); SendKey(VK_LWIN, false);
+    }
+    ShowTrayNotification(T(L"Select an area. The next Windows screenshot will be saved to Desktop.",
+                           L"请选择截图区域，下一张 Windows 截图会保存到桌面。"));
+}
+
 bool RunShutdownCommand(const wchar_t* arguments) {
     wchar_t systemDirectory[MAX_PATH]{};
     if (!GetSystemDirectoryW(systemDirectory, ARRAYSIZE(systemDirectory))) return false;
@@ -1088,8 +1174,10 @@ void CancelShutdown() {
 
 bool IsStartupEnabled() {
     std::wstring current;
-    if (!ReadRegistryString(HKEY_CURRENT_USER, kRunKey, kAppName, current)) return false;
-    return ContainsInsensitive(current, GetModulePath().c_str());
+    if (ReadRegistryString(HKEY_CURRENT_USER, kRunKey, kAppName, current) &&
+        ContainsInsensitive(current, GetModulePath().c_str())) return true;
+    return ReadRegistryString(HKEY_CURRENT_USER, kRunKey, kLegacyAppName, current) &&
+           ContainsInsensitive(current, GetModulePath().c_str());
 }
 
 bool SetStartup(bool enabled) {
@@ -1097,7 +1185,9 @@ bool SetStartup(bool enabled) {
     if (module.empty()) return false;
     if (enabled) {
         if (!WriteRegistryString(HKEY_CURRENT_USER, kRunKey, kAppName, L"\"" + module + L"\"")) return false;
-    } else if (!DeleteRegistryValue(HKEY_CURRENT_USER, kRunKey, kAppName)) return false;
+        DeleteRegistryValue(HKEY_CURRENT_USER, kRunKey, kLegacyAppName);
+    } else if (!DeleteRegistryValue(HKEY_CURRENT_USER, kRunKey, kAppName) ||
+               !DeleteRegistryValue(HKEY_CURRENT_USER, kRunKey, kLegacyAppName)) return false;
     g_startAtLogin = enabled;
     return true;
 }
@@ -2194,11 +2284,51 @@ LRESULT CALLBACK OverlayProc(HWND window, UINT message, WPARAM wParam, LPARAM lP
 }
 
 bool ShowOverlayFromPath(const std::wstring& path, bool restore) {
-    std::vector<BYTE> pixels; UINT width = 0, height = 0;
-    if (!DecodeImage(path, pixels, width, height)) { MessageBoxW(g_window, T(L"Liberty could not decode this image.", L"Liberty 无法读取这张图片。"), kAppName, MB_OK | MB_ICONERROR); return false; }
-    g_overlay.path = path; g_overlay.pixels = std::move(pixels); g_overlay.sourceWidth = width; g_overlay.sourceHeight = height; const float fitScale = (std::min)(1.0f, (std::min)(720.0f / static_cast<float>(width), 520.0f / static_cast<float>(height))); g_overlay.scale = restore ? LoadDword(L"OverlayScalePercent", static_cast<DWORD>(std::round(fitScale * 100.0f))) / 100.0f : fitScale; g_overlay.scale = std::clamp(g_overlay.scale, 0.1f, 5.0f); g_overlay.opacity = static_cast<BYTE>(std::clamp<DWORD>(LoadDword(L"OverlayOpacity", 235), 20, 255)); g_overlay.locked = restore && LoadDword(L"OverlayLocked", 0) != 0; g_overlay.clickThrough = restore && LoadDword(L"OverlayClickThrough", 0) != 0;
-    RECT workArea{}; SystemParametersInfoW(SPI_GETWORKAREA, 0, &workArea, 0); DWORD savedWidth = restore ? LoadDword(L"OverlayWidth", 0) : 0, savedHeight = restore ? LoadDword(L"OverlayHeight", 0) : 0; const int targetWidth = savedWidth ? static_cast<int>(savedWidth) : (std::max)(80, static_cast<int>(std::round(width * g_overlay.scale))); const int targetHeight = savedHeight ? static_cast<int>(savedHeight) : (std::max)(80, static_cast<int>(std::round(height * g_overlay.scale))); const int defaultX = workArea.left + (workArea.right - workArea.left - targetWidth) / 2, defaultY = workArea.top + (workArea.bottom - workArea.top - targetHeight) / 2; const int x = restore ? static_cast<int>(LoadDword(L"OverlayX", defaultX)) : defaultX, y = restore ? static_cast<int>(LoadDword(L"OverlayY", defaultY)) : defaultY;
-    if (!g_overlayWindow) g_overlayWindow = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_LAYERED | (g_overlay.clickThrough ? WS_EX_TRANSPARENT : 0), kOverlayClass, kAppName, WS_POPUP, x, y, targetWidth, targetHeight, nullptr, nullptr, g_instance, nullptr);
+    std::vector<BYTE> pixels;
+    UINT width = 0, height = 0;
+    if (!DecodeImage(path, pixels, width, height)) {
+        MessageBoxW(g_window, T(L"Liberty could not decode this image.", L"Liberty 无法读取这张图片。"),
+                    kAppName, MB_OK | MB_ICONERROR);
+        return false;
+    }
+    g_overlay.path = path;
+    g_overlay.pixels = std::move(pixels);
+    g_overlay.sourceWidth = width;
+    g_overlay.sourceHeight = height;
+
+    POINT cursor{}; GetCursorPos(&cursor);
+    HMONITOR cursorMonitor = MonitorFromPoint(cursor, MONITOR_DEFAULTTONEAREST);
+    MONITORINFO monitorInfo{sizeof(monitorInfo)}; GetMonitorInfoW(cursorMonitor, &monitorInfo);
+    const int workWidth = monitorInfo.rcWork.right - monitorInfo.rcWork.left;
+    const int workHeight = monitorInfo.rcWork.bottom - monitorInfo.rcWork.top;
+    const float fitScale = (std::min)(1.0f, (std::min)(
+        workWidth * 0.55f / static_cast<float>(width),
+        workHeight * 0.62f / static_cast<float>(height)));
+    g_overlay.scale = restore
+        ? LoadDword(L"OverlayScalePercent", static_cast<DWORD>(std::round(fitScale * 100.0f))) / 100.0f
+        : fitScale;
+    g_overlay.scale = std::clamp(g_overlay.scale, 0.1f, 5.0f);
+    g_overlay.opacity = static_cast<BYTE>(std::clamp<DWORD>(
+        restore ? LoadDword(L"OverlayOpacity", 235) : 235, 20, 255));
+    g_overlay.locked = restore && LoadDword(L"OverlayLocked", 0) != 0;
+    g_overlay.clickThrough = restore && LoadDword(L"OverlayClickThrough", 0) != 0;
+
+    const int targetWidth = (std::max)(80, static_cast<int>(std::round(width * g_overlay.scale)));
+    const int targetHeight = (std::max)(80, static_cast<int>(std::round(height * g_overlay.scale)));
+    const int defaultX = monitorInfo.rcWork.left + (workWidth - targetWidth) / 2;
+    const int defaultY = monitorInfo.rcWork.top + (workHeight - targetHeight) / 2;
+    int x = restore ? static_cast<int>(LoadDword(L"OverlayX", defaultX)) : defaultX;
+    int y = restore ? static_cast<int>(LoadDword(L"OverlayY", defaultY)) : defaultY;
+    RECT proposed{x, y, x + targetWidth, y + targetHeight};
+    if (!MonitorFromRect(&proposed, MONITOR_DEFAULTTONULL)) { x = defaultX; y = defaultY; }
+
+    if (!g_overlayWindow) {
+        const DWORD extended = WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_LAYERED | WS_EX_NOACTIVATE |
+                               (g_overlay.clickThrough ? WS_EX_TRANSPARENT : 0);
+        g_overlayWindow = CreateWindowExW(extended, kOverlayClass, kAppName, WS_POPUP,
+                                          x, y, targetWidth, targetHeight, nullptr, nullptr,
+                                          g_instance, nullptr);
+    }
     else SetWindowPos(g_overlayWindow, HWND_TOPMOST, x, y, targetWidth, targetHeight, SWP_NOACTIVATE);
     if (!g_overlayWindow) return false;
     SetOverlayClickThrough(g_overlay.clickThrough);
@@ -2217,6 +2347,25 @@ bool ShowOverlayFromPath(const std::wstring& path, bool restore) {
 
 void OpenOverlayFile(HWND owner) {
     wchar_t fileName[32768]{}; OPENFILENAMEW dialog{sizeof(dialog)}; dialog.hwndOwner = owner; dialog.lpstrFile = fileName; dialog.nMaxFile = ARRAYSIZE(fileName); dialog.lpstrFilter = L"Images\0*.png;*.jpg;*.jpeg;*.bmp;*.gif;*.tif;*.tiff;*.ico\0All files\0*.*\0"; dialog.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_HIDEREADONLY; dialog.lpstrTitle = T(L"Choose an image to pin", L"选择要悬浮的图片"); if (GetOpenFileNameW(&dialog)) ShowOverlayFromPath(fileName, false);
+}
+
+void PasteOverlayFromClipboard(HWND owner) {
+    HBITMAP bitmap = CopyClipboardBitmap();
+    if (!bitmap) {
+        MessageBoxW(owner, T(L"There is no bitmap image in the clipboard.", L"剪贴板中没有可用的图片。"),
+                    kAppName, MB_OK | MB_ICONINFORMATION);
+        return;
+    }
+    const std::wstring directory = GetKnownFolder(FOLDERID_LocalAppData) + L"\\Liberty";
+    CreateDirectoryW(directory.c_str(), nullptr);
+    const std::wstring path = directory + L"\\OverlayClipboard.png";
+    DeleteFileW(path.c_str());
+    const bool saved = SaveBitmapAsPng(bitmap, path);
+    DeleteObject(bitmap);
+    if (!saved || !ShowOverlayFromPath(path, false))
+        MessageBoxW(owner, T(L"Liberty could not create an overlay from the clipboard image.",
+                             L"Liberty 无法从剪贴板图片创建悬浮窗口。"),
+                    kAppName, MB_OK | MB_ICONERROR);
 }
 
 struct __declspec(uuid("6E793361-73C6-11D0-8469-00AA00442901")) LibertyEmptyVolumeCacheCallback : public IUnknown {
@@ -2476,7 +2625,7 @@ void ShowCleanupWindow(HWND owner) {
     const int x = info.rcWork.left + (info.rcWork.right - info.rcWork.left - width) / 2;
     const int y = info.rcWork.top + (info.rcWork.bottom - info.rcWork.top - height) / 2;
     g_cleanupWindow = CreateWindowExW(WS_EX_TOOLWINDOW, kCleanupClass,
-                                      T(L"Liberty cleanup", L"Liberty 清理"),
+                                      T(L"Liberty by Bada cleanup", L"Liberty by Bada 清理"),
                                       WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
                                       x, y, width, height, owner, nullptr, g_instance, nullptr);
     if (g_cleanupWindow) { ShowWindow(g_cleanupWindow, SW_SHOW); UpdateWindow(g_cleanupWindow); }
@@ -2708,7 +2857,7 @@ void ShowStartupWindow(HWND owner) {
     const int x = info.rcWork.left + (info.rcWork.right - info.rcWork.left - width) / 2;
     const int y = info.rcWork.top + (info.rcWork.bottom - info.rcWork.top - height) / 2;
     g_startupWindow = CreateWindowExW(WS_EX_TOOLWINDOW, kStartupClass,
-                                      T(L"Liberty startup manager", L"Liberty 启动项管理"),
+                                      T(L"Liberty by Bada startup manager", L"Liberty by Bada 启动项管理"),
                                       WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
                                       x, y, width, height, owner, nullptr, g_instance, nullptr);
     if (g_startupWindow) { ShowWindow(g_startupWindow, SW_SHOW); UpdateWindow(g_startupWindow); }
@@ -2725,7 +2874,7 @@ void ShowAboutWindow(HWND owner) {
     const int x = info.rcWork.left + (info.rcWork.right - info.rcWork.left - width) / 2;
     const int y = info.rcWork.top + (info.rcWork.bottom - info.rcWork.top - height) / 2;
     g_aboutWindow = CreateWindowExW(WS_EX_TOOLWINDOW, kAboutClass,
-                                    T(L"About Liberty", L"关于 Liberty"),
+                                    T(L"About Liberty by Bada", L"关于 Liberty by Bada"),
                                     WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
                                     x, y, width, height, owner, nullptr, g_instance, nullptr);
     if (g_aboutWindow) ShowWindow(g_aboutWindow, SW_SHOW);
@@ -2769,10 +2918,10 @@ LRESULT CALLBACK AboutProc(HWND window, UINT message, WPARAM wParam, LPARAM lPar
         SetTextColor(hdc, IsDarkTheme() ? RGB(245, 245, 250) : RGB(25, 25, 35));
         HFONT font = CreateUiFont(window, 27, FW_SEMIBOLD, true);
         HFONT old = static_cast<HFONT>(SelectObject(hdc, font));
-        DrawTextW(hdc, L"Liberty", -1, &title, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+        DrawTextW(hdc, kAppName, -1, &title, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
         SelectObject(hdc, old); DeleteObject(font);
         RECT text{ScaleUi(28, dpi), ScaleUi(156, dpi), ScaleUi(480, dpi), ScaleUi(278, dpi)};
-        std::wstring about = L"Liberty 1.3.0\n\n";
+        std::wstring about = L"Liberty by Bada 1.4.0\n\n";
         about += T(L"Trinity mark: freedom, control, and focus.", L"Trinity 标志：自由、控制与专注。\n");
         about += L"\nCmd = "; about += ModifierLabel(g_commandKey);
         about += L"\nOption = "; about += ModifierLabel(g_optionKey);
@@ -2800,40 +2949,27 @@ void AddMenuHeader(std::vector<MenuRow>& rows, const wchar_t* english, const wch
 void AddMenuAction(std::vector<MenuRow>& rows, UINT id, const wchar_t* english, const wchar_t* chinese, bool checked = false, bool enabled = true, const std::wstring& detail = {}) { rows.push_back({MenuRow::Action, id, T(english, chinese), detail, checked, enabled}); }
 
 void AddMenuCategory(std::vector<MenuRow>& rows, UINT id, const wchar_t* english, const wchar_t* chinese,
-                     const wchar_t* englishDetail, const wchar_t* chineseDetail) {
-    rows.push_back({MenuRow::Category, id, T(english, chinese), T(englishDetail, chineseDetail), false, true});
-}
-
-void AddMenuBack(std::vector<MenuRow>& rows) {
-    AddMenuAction(rows, ID_MENU_BACK, L"Back", L"返回");
+                     const wchar_t* englishDetail, const wchar_t* chineseDetail, MenuIcon icon) {
+    rows.push_back({MenuRow::Category, id, T(english, chinese), T(englishDetail, chineseDetail), false, true, icon});
 }
 
 std::vector<MenuRow> BuildMenuRows(MenuPage page = MenuPage::Root) {
     std::vector<MenuRow> rows;
     if (page == MenuPage::Root) {
-        rows.push_back({MenuRow::Status, 0, T(L"Current status", L"当前状态"),
-                        g_enabled ? T(L"Shortcuts enabled", L"快捷键已启用") : T(L"Shortcuts paused", L"快捷键已暂停"), false, true});
-        AddMenuCategory(rows, ID_MENU_SHORTCUTS, L"Shortcuts", L"快捷键", L"Remapping and keyboard settings", L"快捷键转换与键盘设置");
-        AddMenuCategory(rows, ID_MENU_MAINTENANCE, L"System maintenance", L"系统维护", L"Power, startup, cleanup and protection", L"电源、启动、清理与保护");
-        AddMenuCategory(rows, ID_MENU_STATUS, L"Status bar", L"状态栏", L"Current Liberty and overlay state", L"查看 Liberty 与悬浮图片状态");
-        AddMenuCategory(rows, ID_MENU_OTHER, L"Other", L"其他", L"Image overlay, language and about", L"图片悬浮、语言与关于");
+        AddMenuCategory(rows, ID_MENU_SHORTCUTS, L"Shortcuts", L"快捷键", L"Remapping and keyboard settings", L"快捷键转换与键盘设置", MenuIcon::Keyboard);
+        AddMenuCategory(rows, ID_MENU_MAINTENANCE, L"System maintenance", L"系统维护", L"Power, startup, cleanup and protection", L"电源、启动、清理与保护", MenuIcon::Maintenance);
+        AddMenuCategory(rows, ID_MENU_STATUS, L"Status bar", L"状态栏", L"Current Liberty and overlay state", L"查看 Liberty 与悬浮图片状态", MenuIcon::Status);
+        AddMenuCategory(rows, ID_MENU_OTHER, L"Other", L"其他", L"Image overlay, language and about", L"图片悬浮、语言与关于", MenuIcon::Other);
         return rows;
     }
 
-    AddMenuBack(rows);
     if (page == MenuPage::Shortcuts) {
         AddMenuAction(rows, ID_TOGGLE, g_enabled ? L"Pause shortcuts" : L"Resume shortcuts", g_enabled ? L"暂停快捷键" : L"恢复快捷键", g_enabled);
         AddMenuAction(rows, ID_MAPPINGS, L"Keyboard mappings…", L"快捷键映射…");
         AddMenuAction(rows, ID_STARTUP, L"Start Liberty with Windows", L"随 Windows 启动", g_startAtLogin);
     } else if (page == MenuPage::Maintenance) {
-        AddMenuAction(rows, ID_SCREEN_OFF, L"Turn display off", L"关闭显示器");
-        AddMenuAction(rows, ID_SCREENSHOT_DESKTOP, L"Save screenshot to Desktop", L"截图并保存到桌面");
-        AddMenuAction(rows, ID_SHUTDOWN_15, L"Shut down in 15 minutes", L"15 分钟后关机");
-        AddMenuAction(rows, ID_SHUTDOWN_30, L"Shut down in 30 minutes", L"30 分钟后关机");
-        AddMenuAction(rows, ID_SHUTDOWN_60, L"Shut down in 1 hour", L"1 小时后关机");
-        AddMenuAction(rows, ID_SHUTDOWN_120, L"Shut down in 2 hours", L"2 小时后关机");
-        AddMenuAction(rows, ID_SHUTDOWN_CUSTOM, L"Custom shutdown time…", L"自定义关机时间…");
-        AddMenuAction(rows, ID_SHUTDOWN_CANCEL, L"Cancel scheduled shutdown", L"取消定时关机");
+        AddMenuCategory(rows, ID_MENU_POWER, L"Power and shutdown", L"电源与定时关机", L"Display off and shutdown schedules", L"显示器与定时关机设置", MenuIcon::Power);
+        AddMenuCategory(rows, ID_MENU_SCREENSHOTS, L"Windows screenshots", L"Windows 截图", L"Save Snipping Tool results to Desktop", L"将系统截图工具结果保存到桌面", MenuIcon::Screenshot);
         AddMenuAction(rows, ID_STARTUP_MANAGER, L"Manage startup items…", L"管理开机启动项…");
         AddMenuAction(rows, ID_CLEANUP, L"Scan and clean caches…", L"扫描并清理缓存…");
         AddMenuAction(rows, ID_BLOCK_ONEDRIVE, L"Block OneDrive auto-start", L"阻止 OneDrive 自动启动", g_blockOneDrive);
@@ -2846,14 +2982,29 @@ std::vector<MenuRow> BuildMenuRows(MenuPage page = MenuPage::Root) {
         rows.push_back({MenuRow::Status, 0, T(L"OneDrive", L"OneDrive"), g_blockOneDrive ? T(L"Auto-start blocked", L"已阻止自动启动") : T(L"Not blocked", L"未阻止"), false, true});
         rows.push_back({MenuRow::Status, 0, T(L"Floating image", L"悬浮图片"), g_overlayWindow ? T(L"Visible", L"显示中") : T(L"Not open", L"未打开"), false, true});
     } else if (page == MenuPage::Other) {
-        AddMenuAction(rows, ID_OVERLAY_OPEN, L"Pin an image on desktop", L"将图片悬浮在桌面");
+        AddMenuCategory(rows, ID_MENU_OVERLAY, L"Floating image", L"桌面图片悬浮", L"Open, paste and control an overlay", L"打开、粘贴并控制悬浮图片", MenuIcon::Image);
+        AddMenuAction(rows, ID_MENU_LANGUAGE, g_language == AppLanguage::Chinese ? L"Switch to English" : L"切换到简体中文", g_language == AppLanguage::Chinese ? L"切换到 English" : L"切换到简体中文");
+        AddMenuAction(rows, ID_ABOUT, L"About Liberty by Bada", L"关于 Liberty by Bada");
+        AddMenuAction(rows, ID_EXIT, L"Exit Liberty", L"退出 Liberty");
+    } else if (page == MenuPage::Power) {
+        AddMenuAction(rows, ID_SCREEN_OFF, L"Turn display off", L"关闭显示器");
+        AddMenuAction(rows, ID_SHUTDOWN_15, L"Shut down in 15 minutes", L"15 分钟后关机");
+        AddMenuAction(rows, ID_SHUTDOWN_30, L"Shut down in 30 minutes", L"30 分钟后关机");
+        AddMenuAction(rows, ID_SHUTDOWN_60, L"Shut down in 1 hour", L"1 小时后关机");
+        AddMenuAction(rows, ID_SHUTDOWN_120, L"Shut down in 2 hours", L"2 小时后关机");
+        AddMenuAction(rows, ID_SHUTDOWN_CUSTOM, L"Custom shutdown time…", L"自定义关机时间…");
+        AddMenuAction(rows, ID_SHUTDOWN_CANCEL, L"Cancel scheduled shutdown", L"取消定时关机");
+    } else if (page == MenuPage::Screenshots) {
+        AddMenuAction(rows, ID_SCREENSHOT_SNIP_TO_DESKTOP, L"Open Snipping Tool and save next capture", L"打开系统截图并保存下一张截图");
+        AddMenuAction(rows, ID_SCREENSHOT_AUTOSAVE, L"Auto-save Windows screenshots", L"自动保存 Windows 截图", g_autoSaveScreenshots);
+        AddMenuAction(rows, ID_SCREENSHOT_DESKTOP, L"Capture full desktop now", L"立即截取完整桌面");
+    } else if (page == MenuPage::Overlay) {
+        AddMenuAction(rows, ID_OVERLAY_OPEN, L"Choose an image…", L"选择图片…");
+        AddMenuAction(rows, ID_OVERLAY_PASTE, L"Paste image from clipboard", L"从剪贴板粘贴图片");
         AddMenuAction(rows, ID_OVERLAY_RESTORE, L"Restore last image", L"恢复上次图片", false, !g_overlay.path.empty());
         AddMenuAction(rows, ID_OVERLAY_LOCK, g_overlay.locked ? L"Unlock image position" : L"Lock image position", g_overlay.locked ? L"解锁图片位置" : L"锁定图片位置", g_overlay.locked, g_overlayWindow != nullptr);
         AddMenuAction(rows, ID_OVERLAY_CLICKTHROUGH, g_overlay.clickThrough ? L"Disable mouse passthrough" : L"Enable mouse passthrough", g_overlay.clickThrough ? L"关闭鼠标穿透" : L"开启鼠标穿透", g_overlay.clickThrough, g_overlayWindow != nullptr);
         AddMenuAction(rows, ID_OVERLAY_CLOSE, L"Close floating image", L"关闭悬浮图片", false, g_overlayWindow != nullptr);
-        AddMenuAction(rows, ID_MENU_LANGUAGE, g_language == AppLanguage::Chinese ? L"Switch to English" : L"切换到简体中文", g_language == AppLanguage::Chinese ? L"切换到 English" : L"切换到简体中文");
-        AddMenuAction(rows, ID_ABOUT, L"About Liberty", L"关于 Liberty");
-        AddMenuAction(rows, ID_EXIT, L"Exit Liberty", L"退出 Liberty");
     }
     return rows;
 }
@@ -2861,8 +3012,10 @@ std::vector<MenuRow> BuildMenuRows(MenuPage page = MenuPage::Root) {
 int MenuRowHeight(const MenuRow& row, UINT dpi) {
     if (row.kind == MenuRow::Header) return ScaleUi(34, dpi);
     if (row.kind == MenuRow::Separator) return ScaleUi(10, dpi);
-    if (row.kind == MenuRow::Status) return ScaleUi(60, dpi);
-    return ScaleUi(58, dpi);
+    if (g_menuPage == MenuPage::Root) return ScaleUi(60, dpi);
+    if (row.kind == MenuRow::Status) return ScaleUi(52, dpi);
+    if (row.kind == MenuRow::Category) return ScaleUi(52, dpi);
+    return ScaleUi(46, dpi);
 }
 
 int MenuTopHeight(UINT dpi) { return ScaleUi(92, dpi); }
@@ -2883,16 +3036,97 @@ int MenuHitTest(int y, const std::vector<MenuRow>& rows, int scroll, UINT dpi) {
     return -1;
 }
 
+MenuPage ParentMenuPage(MenuPage page) {
+    if (page == MenuPage::Power || page == MenuPage::Screenshots) return MenuPage::Maintenance;
+    if (page == MenuPage::Overlay) return MenuPage::Other;
+    return MenuPage::Root;
+}
+
+void NavigateMenu(MenuPage page, bool back = false) {
+    g_menuSlideDirection = back ? -1 : 1;
+    g_menuPage = page;
+    RefreshModernMenu();
+}
+
+RECT MenuBackRect(UINT dpi) {
+    return {ScaleUi(12, dpi), ScaleUi(22, dpi), ScaleUi(48, dpi), ScaleUi(58, dpi)};
+}
+
+void DrawBackGlyph(HDC hdc, const RECT& bounds, COLORREF color) {
+    const int stroke = (std::max)(1, static_cast<int>((bounds.bottom - bounds.top) / 14));
+    HPEN pen = CreatePen(PS_SOLID, stroke, color);
+    HGDIOBJ oldPen = SelectObject(hdc, pen);
+    const int centerY = (bounds.top + bounds.bottom) / 2;
+    MoveToEx(hdc, bounds.right - (bounds.right - bounds.left) / 5, centerY, nullptr);
+    LineTo(hdc, bounds.left + (bounds.right - bounds.left) / 4, centerY);
+    LineTo(hdc, bounds.left + (bounds.right - bounds.left) / 2, bounds.top + (bounds.bottom - bounds.top) / 4);
+    MoveToEx(hdc, bounds.left + (bounds.right - bounds.left) / 4, centerY, nullptr);
+    LineTo(hdc, bounds.left + (bounds.right - bounds.left) / 2, bounds.bottom - (bounds.bottom - bounds.top) / 4);
+    SelectObject(hdc, oldPen); DeleteObject(pen);
+}
+
+void DrawMenuIcon(HDC hdc, MenuIcon icon, const RECT& bounds, COLORREF color) {
+    if (icon == MenuIcon::None) return;
+    const int width = bounds.right - bounds.left;
+    const int height = bounds.bottom - bounds.top;
+    const int stroke = (std::max)(1, width / 12);
+    HPEN pen = CreatePen(PS_SOLID, stroke, color);
+    HGDIOBJ oldPen = SelectObject(hdc, pen);
+    HGDIOBJ oldBrush = SelectObject(hdc, GetStockObject(NULL_BRUSH));
+    if (icon == MenuIcon::Keyboard) {
+        RoundRect(hdc, bounds.left, bounds.top + height / 6, bounds.right, bounds.bottom - height / 6, width / 6, height / 6);
+        for (int index = 1; index <= 3; ++index) {
+            MoveToEx(hdc, bounds.left + index * width / 5, bounds.top + height / 3, nullptr);
+            LineTo(hdc, bounds.left + index * width / 5, bounds.top + height / 2);
+        }
+        MoveToEx(hdc, bounds.left + width / 4, bounds.bottom - height / 3, nullptr);
+        LineTo(hdc, bounds.right - width / 4, bounds.bottom - height / 3);
+    } else if (icon == MenuIcon::Maintenance) {
+        Ellipse(hdc, bounds.left + width / 4, bounds.top + height / 4, bounds.right - width / 4, bounds.bottom - height / 4);
+        for (int index = 0; index < 4; ++index) {
+            const int x = index % 2 ? bounds.right - width / 6 : bounds.left + width / 6;
+            const int y = index / 2 ? bounds.bottom - height / 6 : bounds.top + height / 6;
+            MoveToEx(hdc, (bounds.left + bounds.right) / 2, (bounds.top + bounds.bottom) / 2, nullptr); LineTo(hdc, x, y);
+        }
+    } else if (icon == MenuIcon::Status) {
+        MoveToEx(hdc, bounds.left + width / 6, bounds.bottom - height / 5, nullptr); LineTo(hdc, bounds.left + width / 6, bounds.top + height / 2);
+        MoveToEx(hdc, bounds.left + width / 2, bounds.bottom - height / 5, nullptr); LineTo(hdc, bounds.left + width / 2, bounds.top + height / 3);
+        MoveToEx(hdc, bounds.right - width / 6, bounds.bottom - height / 5, nullptr); LineTo(hdc, bounds.right - width / 6, bounds.top + height / 6);
+    } else if (icon == MenuIcon::Other) {
+        HBRUSH dot = CreateSolidBrush(color); SelectObject(hdc, dot);
+        for (int index = 0; index < 3; ++index) Ellipse(hdc, bounds.left + index * width / 3 + width / 10, bounds.top + height / 2 - width / 10, bounds.left + index * width / 3 + width / 10 * 2, bounds.top + height / 2);
+        SelectObject(hdc, GetStockObject(NULL_BRUSH)); DeleteObject(dot);
+    } else if (icon == MenuIcon::Power) {
+        Arc(hdc, bounds.left + width / 6, bounds.top + height / 6, bounds.right - width / 6, bounds.bottom - height / 8,
+            bounds.left + width / 3, bounds.top + height / 5, bounds.right - width / 3, bounds.top + height / 5);
+        MoveToEx(hdc, (bounds.left + bounds.right) / 2, bounds.top + height / 10, nullptr); LineTo(hdc, (bounds.left + bounds.right) / 2, bounds.top + height / 2);
+    } else if (icon == MenuIcon::Screenshot) {
+        Rectangle(hdc, bounds.left + width / 8, bounds.top + height / 5, bounds.right - width / 8, bounds.bottom - height / 5);
+        Ellipse(hdc, bounds.left + width / 3, bounds.top + height / 3, bounds.right - width / 3, bounds.bottom - height / 3);
+    } else if (icon == MenuIcon::Image) {
+        Rectangle(hdc, bounds.left + width / 10, bounds.top + height / 7, bounds.right - width / 10, bounds.bottom - height / 7);
+        MoveToEx(hdc, bounds.left + width / 6, bounds.bottom - height / 4, nullptr);
+        LineTo(hdc, bounds.left + width / 2, bounds.top + height / 2);
+        LineTo(hdc, bounds.right - width / 6, bounds.bottom - height / 4);
+    }
+    SelectObject(hdc, oldBrush); SelectObject(hdc, oldPen); DeleteObject(pen);
+}
+
 void ExecuteCommand(UINT command) {
     switch (command) {
-    case ID_MENU_SHORTCUTS: g_menuPage = MenuPage::Shortcuts; RefreshModernMenu(); break;
-    case ID_MENU_MAINTENANCE: g_menuPage = MenuPage::Maintenance; RefreshModernMenu(); break;
-    case ID_MENU_STATUS: g_menuPage = MenuPage::Status; RefreshModernMenu(); break;
-    case ID_MENU_OTHER: g_menuPage = MenuPage::Other; RefreshModernMenu(); break;
-    case ID_MENU_BACK: g_menuPage = MenuPage::Root; RefreshModernMenu(); break;
+    case ID_MENU_SHORTCUTS: NavigateMenu(MenuPage::Shortcuts); break;
+    case ID_MENU_MAINTENANCE: NavigateMenu(MenuPage::Maintenance); break;
+    case ID_MENU_STATUS: NavigateMenu(MenuPage::Status); break;
+    case ID_MENU_OTHER: NavigateMenu(MenuPage::Other); break;
+    case ID_MENU_POWER: NavigateMenu(MenuPage::Power); break;
+    case ID_MENU_SCREENSHOTS: NavigateMenu(MenuPage::Screenshots); break;
+    case ID_MENU_OVERLAY: NavigateMenu(MenuPage::Overlay); break;
+    case ID_MENU_BACK: NavigateMenu(ParentMenuPage(g_menuPage), true); break;
     case ID_TOGGLE: g_enabled = !g_enabled; SaveDword(L"Enabled", g_enabled ? 1 : 0); ResetMappedModifierState(); RefreshTrayIcon(); break;
     case ID_SCREEN_OFF: ScreenOff(); break;
     case ID_SCREENSHOT_DESKTOP: if (!CaptureDesktopScreenshot()) MessageBoxW(g_window, T(L"Liberty could not save the desktop screenshot.", L"Liberty 无法保存桌面截图。"), kAppName, MB_OK | MB_ICONERROR); break;
+    case ID_SCREENSHOT_SNIP_TO_DESKTOP: StartWindowsSnippingToDesktop(); break;
+    case ID_SCREENSHOT_AUTOSAVE: g_autoSaveScreenshots = !g_autoSaveScreenshots; SaveDword(L"AutoSaveScreenshots", g_autoSaveScreenshots ? 1 : 0); ShowTrayNotification(g_autoSaveScreenshots ? T(L"Windows screenshots will be saved to Desktop.", L"Windows 截图将自动保存到桌面。") : T(L"Automatic screenshot saving is off.", L"截图自动保存已关闭。")); break;
     case ID_SHUTDOWN_15: ScheduleShutdown(15 * 60); break;
     case ID_SHUTDOWN_30: ScheduleShutdown(30 * 60); break;
     case ID_SHUTDOWN_60: ScheduleShutdown(60 * 60); break;
@@ -2908,6 +3142,7 @@ void ExecuteCommand(UINT command) {
     case ID_HIDE_AMD: if (ApplyRunEntryBlocks(kAmdEntries, ARRAYSIZE(kAmdEntries), !g_hideAmdPanel)) { g_hideAmdPanel = !g_hideAmdPanel; SaveDword(L"HideAmdPanel", g_hideAmdPanel ? 1 : 0); } else MessageBoxW(g_window, T(L"Could not update AMD startup entries.", L"无法更新 AMD 启动入口。"), kAppName, MB_OK | MB_ICONERROR); break;
     case ID_HIDE_SECURITY: { const bool next = !g_hideSecurityCenter; if (SetSecurityCenterHidden(next)) g_hideSecurityCenter = next; else MessageBoxW(g_window, T(L"Could not change the Windows Security tray policy. Try again and allow UAC.", L"无法修改 Windows Security 托盘策略。请重试并允许 UAC。"), kAppName, MB_OK | MB_ICONERROR); break; }
     case ID_OVERLAY_OPEN: OpenOverlayFile(g_window); break;
+    case ID_OVERLAY_PASTE: PasteOverlayFromClipboard(g_window); break;
     case ID_OVERLAY_RESTORE: { std::wstring path; if (!LoadStringSetting(L"OverlayPath", path) || path.empty() || !ShowOverlayFromPath(path, true)) MessageBoxW(g_window, T(L"There is no restorable image.", L"没有可恢复的图片。"), kAppName, MB_OK | MB_ICONINFORMATION); break; }
     case ID_OVERLAY_LOCK: g_overlay.locked = !g_overlay.locked; SaveOverlaySettings(); break;
     case ID_OVERLAY_CLICKTHROUGH: SetOverlayClickThrough(!g_overlay.clickThrough); break;
@@ -3015,6 +3250,8 @@ LRESULT CALLBACK MenuProc(HWND window, UINT message, WPARAM wParam, LPARAM lPara
         g_menuScroll = 0;
         g_menuHover = -1;
         g_menuSelected = -1;
+        g_menuSlideStart = GetTickCount();
+        SetTimer(window, kMenuAnimationTimer, 16, nullptr);
         SetCapture(window);
         SetFocus(window);
         InvalidateRect(window, nullptr, TRUE);
@@ -3036,20 +3273,30 @@ LRESULT CALLBACK MenuProc(HWND window, UINT message, WPARAM wParam, LPARAM lPara
         FillRect(buffer, &client, background);
         DeleteObject(background);
 
-        RECT logo{ScaleUi(18, dpi), ScaleUi(14, dpi), ScaleUi(78, dpi), ScaleUi(74, dpi)};
+        const bool childPage = g_menuPage != MenuPage::Root;
+        if (childPage) DrawBackGlyph(buffer, MenuBackRect(dpi), dark ? RGB(225, 228, 238) : RGB(48, 51, 62));
+        RECT logo = childPage
+            ? RECT{ScaleUi(56, dpi), ScaleUi(18, dpi), ScaleUi(104, dpi), ScaleUi(66, dpi)}
+            : RECT{ScaleUi(18, dpi), ScaleUi(14, dpi), ScaleUi(78, dpi), ScaleUi(74, dpi)};
         DrawTrinityLogo(buffer, logo, true);
         SetBkMode(buffer, TRANSPARENT);
         SetTextColor(buffer, dark ? RGB(245, 245, 250) : RGB(28, 29, 38));
-        HFONT titleFont = CreateUiFont(window, 20, FW_SEMIBOLD, true);
+        HFONT titleFont = CreateUiFont(window, childPage ? 17 : 20, FW_SEMIBOLD, true);
         HFONT oldFont = static_cast<HFONT>(SelectObject(buffer, titleFont));
-        RECT title{ScaleUi(94, dpi), ScaleUi(18, dpi), client.right - ScaleUi(18, dpi), ScaleUi(48, dpi)};
-        DrawTextW(buffer, L"Liberty", -1, &title, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+        RECT title{ScaleUi(childPage ? 116 : 94, dpi), ScaleUi(18, dpi), client.right - ScaleUi(18, dpi), ScaleUi(48, dpi)};
+        DrawTextW(buffer, kAppName, -1, &title, DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
         SelectObject(buffer, oldFont);
         DeleteObject(titleFont);
 
         const int contentTop = MenuTopHeight(dpi);
         const int contentClip = SaveDC(buffer);
         IntersectClipRect(buffer, 0, contentTop, client.right, client.bottom);
+        int slideOffset = 0;
+        if (g_menuSlideStart) {
+            const DWORD elapsed = GetTickCount() - g_menuSlideStart;
+            if (elapsed < 170) slideOffset = g_menuSlideDirection * ScaleUi(48, dpi) * static_cast<int>(170 - elapsed) / 170;
+        }
+        SetViewportOrgEx(buffer, slideOffset, 0, nullptr);
         int current = contentTop - g_menuScroll;
         for (size_t index = 0; index < rows.size(); ++index) {
             const MenuRow& row = rows[index];
@@ -3090,6 +3337,12 @@ LRESULT CALLBACK MenuProc(HWND window, UINT message, WPARAM wParam, LPARAM lPara
                         DeleteObject(hover);
                         DeleteObject(pen);
                     }
+                    if (row.icon != MenuIcon::None) {
+                        RECT iconRect{ScaleUi(20, dpi), rowRect.top + ScaleUi(14, dpi),
+                                      ScaleUi(44, dpi), rowRect.top + ScaleUi(38, dpi)};
+                        DrawMenuIcon(buffer, row.icon, iconRect,
+                                     row.enabled ? RGB(79, 140, 255) : RGB(110, 112, 122));
+                    }
                     if (row.checked) {
                         HBRUSH check = CreateSolidBrush(RGB(79, 140, 255));
                         RECT checkRect{ScaleUi(22, dpi), rowRect.top + ScaleUi(16, dpi),
@@ -3099,16 +3352,17 @@ LRESULT CALLBACK MenuProc(HWND window, UINT message, WPARAM wParam, LPARAM lPara
                     }
                     SetTextColor(buffer, row.enabled ? (dark ? RGB(245, 245, 250) : RGB(32, 33, 42))
                                                        : (dark ? RGB(100, 103, 115) : RGB(170, 171, 180)));
-                    HFONT actionFont = CreateUiFont(window, 16, FW_MEDIUM);
+                    HFONT actionFont = CreateUiFont(window, g_menuPage == MenuPage::Root ? 15 : 14, FW_MEDIUM);
                     HFONT old = static_cast<HFONT>(SelectObject(buffer, actionFont));
-                    RECT text{ScaleUi(52, dpi), rowRect.top + ScaleUi(8, dpi),
+                    const int textLeft = (row.icon != MenuIcon::None || row.checked) ? ScaleUi(52, dpi) : ScaleUi(24, dpi);
+                    RECT text{textLeft, rowRect.top + ScaleUi(row.kind == MenuRow::Category ? 5 : 6, dpi),
                                 rowRect.right - ScaleUi(18, dpi), rowRect.bottom - ScaleUi(4, dpi)};
                     DrawTextW(buffer, row.label.c_str(), -1, &text, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
                     if (row.kind == MenuRow::Category) {
                         SetTextColor(buffer, dark ? RGB(170, 175, 190) : RGB(97, 100, 118));
                         HFONT detailFont = CreateUiFont(window, 13, FW_NORMAL);
                         SelectObject(buffer, detailFont);
-                        RECT detail{ScaleUi(52, dpi), rowRect.top + ScaleUi(31, dpi), rowRect.right - ScaleUi(42, dpi), rowRect.bottom};
+                        RECT detail{textLeft, rowRect.top + ScaleUi(28, dpi), rowRect.right - ScaleUi(42, dpi), rowRect.bottom};
                         DrawTextW(buffer, row.detail.c_str(), -1, &detail, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
                         RECT arrow{rowRect.right - ScaleUi(30, dpi), rowRect.top, rowRect.right - ScaleUi(12, dpi), rowRect.bottom};
                         DrawTextW(buffer, L"›", -1, &arrow, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
@@ -3140,6 +3394,16 @@ LRESULT CALLBACK MenuProc(HWND window, UINT message, WPARAM wParam, LPARAM lPara
         if (hit != g_menuHover) { g_menuHover = hit; InvalidateRect(window, nullptr, FALSE); }
         return 0;
     }
+    case WM_TIMER:
+        if (wParam == kMenuAnimationTimer) {
+            if (GetTickCount() - g_menuSlideStart >= 170) {
+                KillTimer(window, kMenuAnimationTimer);
+                g_menuSlideStart = 0;
+            }
+            InvalidateRect(window, nullptr, FALSE);
+            return 0;
+        }
+        break;
     case WM_MOUSELEAVE:
         g_menuHover = -1;
         InvalidateRect(window, nullptr, FALSE);
@@ -3160,6 +3424,11 @@ LRESULT CALLBACK MenuProc(HWND window, UINT message, WPARAM wParam, LPARAM lPara
         return 0;
     }
     case WM_LBUTTONUP: {
+        POINT point{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+        if (g_menuPage != MenuPage::Root) {
+            RECT back = MenuBackRect(dpi);
+            if (PtInRect(&back, point)) { ExecuteCommand(ID_MENU_BACK); return 0; }
+        }
         const int hit = MenuHitTest(GET_Y_LPARAM(lParam), rows, g_menuScroll, dpi);
         if (hit >= 0 && (rows[static_cast<size_t>(hit)].kind == MenuRow::Action || rows[static_cast<size_t>(hit)].kind == MenuRow::Category) && rows[static_cast<size_t>(hit)].enabled) {
             const UINT command = rows[static_cast<size_t>(hit)].id;
@@ -3167,7 +3436,6 @@ LRESULT CALLBACK MenuProc(HWND window, UINT message, WPARAM wParam, LPARAM lPara
             ExecuteCommand(command);
         } else {
             RECT client{}; GetClientRect(window, &client);
-            POINT point{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
             if (!PtInRect(&client, point)) DestroyWindow(window);
         }
         return 0;
@@ -3176,6 +3444,7 @@ LRESULT CALLBACK MenuProc(HWND window, UINT message, WPARAM wParam, LPARAM lPara
         DestroyWindow(window); return 0;
     case WM_KEYDOWN:
         if (wParam == VK_ESCAPE) { DestroyWindow(window); return 0; }
+        if ((wParam == VK_LEFT || wParam == VK_BACK) && g_menuPage != MenuPage::Root) { ExecuteCommand(ID_MENU_BACK); return 0; }
         if (wParam == VK_DOWN || wParam == VK_UP) {
             const int direction = wParam == VK_DOWN ? 1 : -1;
             int index = g_menuSelected < 0 ? (direction > 0 ? 0 : static_cast<int>(rows.size()) - 1) : g_menuSelected + direction;
@@ -3193,6 +3462,7 @@ LRESULT CALLBACK MenuProc(HWND window, UINT message, WPARAM wParam, LPARAM lPara
     case WM_CANCELMODE: DestroyWindow(window); return 0;
     case WM_SETTINGCHANGE: SetDarkMode(window, IsDarkTheme()); InvalidateRect(window, nullptr, TRUE); return 0;
     case WM_NCDESTROY:
+        KillTimer(window, kMenuAnimationTimer);
         if (GetCapture() == window) ReleaseCapture();
         if (g_menuWindow == window) g_menuWindow = nullptr;
         return DefWindowProcW(window, message, wParam, lParam);
@@ -3208,8 +3478,22 @@ bool RegisterClasses() {
         case WM_TIMER: if (wParam == kOneDriveRefreshTimer && g_blockOneDrive) ApplyOneDriveBlock(true, false); return 0;
         case WM_HOTKEY: if (wParam == 1) { g_enabled = !g_enabled; SaveDword(L"Enabled", g_enabled ? 1 : 0); ResetMappedModifierState(); RefreshTrayIcon(); } if (wParam == 2) ScreenOff(); if (wParam == 3) ScheduleShutdown(60 * 60); if (wParam == 4) CancelShutdown(); return 0;
         case kTrayMessage: { const UINT trayEvent = LOWORD(lParam); if (trayEvent == WM_LBUTTONUP) { g_enabled = !g_enabled; SaveDword(L"Enabled", g_enabled ? 1 : 0); ResetMappedModifierState(); RefreshTrayIcon(); } else if (trayEvent == WM_RBUTTONUP || trayEvent == WM_CONTEXTMENU) HandleTrayMenuEvent(window, trayEvent); return 0; }
+        case WM_CLIPBOARDUPDATE: {
+            const DWORD sequence = GetClipboardSequenceNumber();
+            if (sequence == g_lastClipboardSequence) return 0;
+            g_lastClipboardSequence = sequence;
+            if (g_screenshotCaptureArmed && GetTickCount() - g_screenshotArmTick > 120000) g_screenshotCaptureArmed = false;
+            const bool shouldSave = g_screenshotCaptureArmed ||
+                                    (g_autoSaveScreenshots && ClipboardOwnerLooksLikeSnippingTool());
+            if (shouldSave && IsClipboardFormatAvailable(CF_BITMAP)) {
+                const bool saved = SaveClipboardScreenshotToDesktop();
+                if (g_screenshotCaptureArmed) g_screenshotCaptureArmed = false;
+                if (!saved) ShowTrayNotification(T(L"The screenshot reached the clipboard but could not be saved.", L"截图已到达剪贴板，但保存失败。"));
+            }
+            return 0;
+        }
         case WM_SETTINGCHANGE: if (g_menuWindow) InvalidateRect(g_menuWindow, nullptr, TRUE); return 0;
-        case WM_DESTROY: KillTimer(window, kOneDriveRefreshTimer); ResetMappedModifierState(); UnregisterHotKey(window, 1); UnregisterHotKey(window, 2); UnregisterHotKey(window, 3); UnregisterHotKey(window, 4); if (g_hook) { UnhookWindowsHookEx(g_hook); g_hook = nullptr; } CloseOverlay(); if (g_cleanupWindow) DestroyWindow(g_cleanupWindow); if (g_startupWindow) DestroyWindow(g_startupWindow); if (g_aboutWindow) DestroyWindow(g_aboutWindow); Shell_NotifyIconW(NIM_DELETE, &g_tray); if (g_tray.hIcon) { DestroyIcon(g_tray.hIcon); g_tray.hIcon = nullptr; } PostQuitMessage(0); return 0;
+        case WM_DESTROY: KillTimer(window, kOneDriveRefreshTimer); RemoveClipboardFormatListener(window); ResetMappedModifierState(); UnregisterHotKey(window, 1); UnregisterHotKey(window, 2); UnregisterHotKey(window, 3); UnregisterHotKey(window, 4); if (g_hook) { UnhookWindowsHookEx(g_hook); g_hook = nullptr; } CloseOverlay(); if (g_cleanupWindow) DestroyWindow(g_cleanupWindow); if (g_startupWindow) DestroyWindow(g_startupWindow); if (g_aboutWindow) DestroyWindow(g_aboutWindow); Shell_NotifyIconW(NIM_DELETE, &g_tray); if (g_tray.hIcon) { DestroyIcon(g_tray.hIcon); g_tray.hIcon = nullptr; } PostQuitMessage(0); return 0;
         }
         return DefWindowProcW(window, message, wParam, lParam);
     };
@@ -3242,13 +3526,15 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
             if (_wcsicmp(arguments[index], L"--cleanup") == 0 && index + 1 < argumentCount) { const std::wstring path = arguments[index + 1]; LocalFree(arguments); RunCleanupHelper(path); return 1; }
             if (_wcsicmp(arguments[index], L"--startup-apply") == 0 && index + 1 < argumentCount) { const std::wstring path = arguments[index + 1]; LocalFree(arguments); RunStartupHelper(path); return 1; }
             if (_wcsicmp(arguments[index], L"--overlay") == 0 && index + 1 < argumentCount) g_initialOverlayPath = arguments[++index];
+            if (_wcsicmp(arguments[index], L"--save-next-screenshot") == 0) { g_screenshotCaptureArmed = true; g_screenshotArmTick = GetTickCount(); }
         }
         LocalFree(arguments);
     }
     g_mutex = CreateMutexW(nullptr, TRUE, L"Local\\Liberty.SingleInstance"); if (!g_mutex || GetLastError() == ERROR_ALREADY_EXISTS) return 0;
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED); Gdiplus::GdiplusStartupInput gdiplusInput; Gdiplus::GdiplusStartup(&g_gdiplusToken, &gdiplusInput, nullptr); INITCOMMONCONTROLSEX controls{sizeof(controls), ICC_LISTVIEW_CLASSES | ICC_STANDARD_CLASSES}; InitCommonControlsEx(&controls); InitializeLanguage();
-    g_enabled = LoadDword(L"Enabled", 1) != 0; g_startAtLogin = IsStartupEnabled(); g_blockOneDrive = LoadDword(L"BlockOneDrive", 0) != 0; g_hideNvidiaPanel = LoadDword(L"HideNvidiaPanel", 0) != 0; g_hideAmdPanel = LoadDword(L"HideAmdPanel", 0) != 0; g_hideSecurityCenter = IsSecurityCenterHidden(); LoadModifierMappings(); g_taskbarCreated = RegisterWindowMessageW(L"TaskbarCreated"); if (!RegisterClasses()) return 1;
+    g_enabled = LoadDword(L"Enabled", 1) != 0; g_startAtLogin = IsStartupEnabled(); g_blockOneDrive = LoadDword(L"BlockOneDrive", 0) != 0; g_hideNvidiaPanel = LoadDword(L"HideNvidiaPanel", 0) != 0; g_hideAmdPanel = LoadDword(L"HideAmdPanel", 0) != 0; g_hideSecurityCenter = IsSecurityCenterHidden(); g_autoSaveScreenshots = LoadDword(L"AutoSaveScreenshots", 0) != 0; LoadModifierMappings(); g_taskbarCreated = RegisterWindowMessageW(L"TaskbarCreated"); if (!RegisterClasses()) return 1;
     g_window = CreateWindowExW(WS_EX_TOOLWINDOW, kWindowClass, kAppName, WS_OVERLAPPED, 0, 0, 0, 0, nullptr, nullptr, instance, nullptr); if (!g_window) return 1;
+    AddClipboardFormatListener(g_window); g_lastClipboardSequence = GetClipboardSequenceNumber();
     if (g_blockOneDrive) ApplyOneDriveBlock(true, true); if (g_hideNvidiaPanel) ApplyRunEntryBlocks(kNvidiaEntries, ARRAYSIZE(kNvidiaEntries), true); if (g_hideAmdPanel) ApplyRunEntryBlocks(kAmdEntries, ARRAYSIZE(kAmdEntries), true); SetTimer(g_window, kOneDriveRefreshTimer, 30000, nullptr);
     g_tray.cbSize = sizeof(g_tray); g_tray.hWnd = g_window; g_tray.uID = 1; g_tray.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_SHOWTIP; g_tray.uCallbackMessage = kTrayMessage; g_tray.hIcon = CreateTrinityIcon(g_enabled); UpdateTrayTip(); Shell_NotifyIconW(NIM_ADD, &g_tray); g_tray.uVersion = NOTIFYICON_VERSION_4; Shell_NotifyIconW(NIM_SETVERSION, &g_tray);
     RegisterHotKey(g_window, 1, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, VK_F9); RegisterHotKey(g_window, 2, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, VK_F10); RegisterHotKey(g_window, 3, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, VK_F11); RegisterHotKey(g_window, 4, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, VK_F12); g_hook = SetWindowsHookExW(WH_KEYBOARD_LL, KeyboardProc, instance, 0);

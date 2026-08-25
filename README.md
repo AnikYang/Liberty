@@ -1,20 +1,20 @@
-# Liberty
+# Liberty by Bada
 
 ![Liberty Trinity logo](assets/liberty-trinity.svg)
 
-Liberty is a portable native C++/Win32 utility for Windows 10/11 x64. It combines macOS-style keyboard muscle memory, a modern tray menu, reversible startup controls, a desktop image pin, and a conservative Windows cleanup scanner in one `Liberty.exe`.
+Liberty by Bada is a portable native C++/Win32 utility for Windows 10/11 x64. It combines macOS-style keyboard muscle memory, a modern tray menu, reversible startup controls, a desktop image pin, and a conservative Windows cleanup scanner in one `Liberty.exe`.
 
 Liberty does not ship a .NET, Python, Node, Qt, or other runtime. The release executable is built with the static MSVC runtime and uses documented Windows APIs.
 
 ## Features
 
-- Compact Windows 11-inspired custom tray popup: the root view is capped at roughly one third of the work area, with Shortcuts / System maintenance / Status bar / Other submenus. The Trinity logo and Liberty title stay in a fixed, clipped header while submenu content scrolls underneath without text overlap.
+- Compact Windows 11-inspired custom tray popup: the root view is capped at roughly one third of the work area, with icons for Shortcuts / System maintenance / Status bar / Other. Fixed header back navigation, left-aligned submenus, smaller secondary pages, third-level Power / Screenshots / Floating image pages, and 170 ms horizontal transitions keep the layout readable.
 - Uses `Segoe UI Variable Text` / `Segoe UI Variable Display` with a Windows 10 fallback so Chinese and English controls remain readable on high-resolution displays.
 - 简体中文 / English switching. The default follows the Windows UI language and the selected language is saved per user.
 - Cmd / Option / Control physical-key mapping. Choose left/right Windows, Alt, Control, or Caps Lock; mappings must remain distinct.
 - Startup manager covering Run/RunOnce/RunOnceEx, legacy Windows run/load values, per-user and common Startup folders, logon/boot Task Scheduler entries, and automatic Win32 services. It marks launcher/updater/script chains, duplicate wake-up paths, suspicious locations, and common third-party background helpers without treating Chinese software as malware by name alone.
 - Custom shutdown from 1–10080 minutes with input focus, validation, Enter confirmation, and Esc cancellation.
-- Full virtual-desktop screenshot capture saved as a timestamped PNG on the Desktop, including multi-monitor layouts.
+- Windows Snipping Tool integration: launch the standard `ms-screenclip` UI and save its next clipboard bitmap to the Desktop instead of leaving it only in the clipboard. Optional persistent auto-save recognizes Windows clipping processes; direct full virtual-desktop capture remains available.
 - OneDrive auto-start blocking that backs up and restores the current-user Run value, StartupApproved bytes, matching Startup-folder shortcuts, and the `OneDrive Startup Task-*` login tasks. It does not disable OneDrive update/reporting tasks or delete synced data.
 - Reversible NVIDIA and AMD panel startup-entry hiding. Driver services are never stopped.
 - Windows Security tray-entry hiding via the documented `HideSystray` policy. Defender, real-time protection, and security services remain enabled.
@@ -82,11 +82,13 @@ The result is `Liberty.exe`. The build targets Release x64, embeds the Trinity I
 
 Liberty has no network code, telemetry, updater, service, or installer. Settings and reversible backups are stored under `HKCU\Software\Liberty`. The cleanup tool only invokes Windows' registered cleanup handlers after the user selects categories.
 
-This project is released under the [MIT License](LICENSE). The overlay interaction model was reviewed against the MIT-licensed [PinView](https://github.com/Pragyanand/PinView) and [TraceIt](https://github.com/SigNeedsGit/TraceIt); no third-party source or runtime is embedded in Liberty.
+This project is released under the [MIT License](LICENSE). The overlay interaction model and window lifecycle are ported from patterns documented by [PinView](https://github.com/Pragyanand/PinView), [TraceIt](https://github.com/SigNeedsGit/TraceIt), and Apache-2.0 [Screen Mask](https://github.com/didvc/screen-masking). See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). No Python, Electron, Node.js, Qt runtime, or external overlay executable is bundled.
 
-## Liberty（中文说明）
+## Liberty by Bada（中文说明）
 
 Liberty 是面向 Windows 10/11 x64 的原生 C++/Win32 便携工具。右键托盘图标可以打开紧凑的 Windows 11 风格菜单，按“快捷键、系统维护、状态栏、其他”分组，并在中文和 English 之间切换。工具包含快捷键映射、定时关机、桌面截图保存、启动项管理、OneDrive 自动启动阻止、NVIDIA/AMD 面板启动隐藏、Windows Security 托盘入口隐藏、桌面图片悬浮，以及基于 Windows 内置清理处理器的 DPI 自适应缓存清理窗口。
+
+截图三级菜单可以启动 Windows 默认截图界面，并监听下一张截图的剪贴板位图，将其以 PNG 保存到桌面；也可以开启持久化自动保存。悬浮图片三级菜单支持选择文件、从剪贴板粘贴、恢复、锁定、透明度与鼠标穿透。
 
 启动项管理会扫描 Run/RunOnce/RunOnceEx、旧式 run/load、启动文件夹、登录任务和自动启动服务。它会标记启动器、更新器、脚本、重复唤醒链、临时目录和常见第三方后台助手；“选择风险项”只做选择，不会自动禁用，确认后才会执行。系统保护项保持只读，所有实际修改都支持恢复。
 

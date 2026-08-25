@@ -12,6 +12,7 @@ Liberty does not ship a .NET, Python, Node, Qt, or other runtime. The release ex
 - Uses `Segoe UI Variable Text` / `Segoe UI Variable Display` with a Windows 10 fallback so Chinese and English controls remain readable on high-resolution displays.
 - 简体中文 / English switching. The default follows the Windows UI language and the selected language is saved per user.
 - Cmd / Option / Control physical-key mapping. Choose left/right Windows, Alt, Control, or Caps Lock; mappings must remain distinct.
+- Startup manager covering Run/RunOnce/RunOnceEx, legacy Windows run/load values, per-user and common Startup folders, logon/boot Task Scheduler entries, and automatic Win32 services. It marks launcher/updater/script chains, duplicate wake-up paths, suspicious locations, and common third-party background helpers without treating Chinese software as malware by name alone.
 - Custom shutdown from 1–10080 minutes with input focus, validation, Enter confirmation, and Esc cancellation.
 - Full virtual-desktop screenshot capture saved as a timestamped PNG on the Desktop, including multi-monitor layouts.
 - OneDrive auto-start blocking that backs up and restores the current-user Run value, StartupApproved bytes, matching Startup-folder shortcuts, and the `OneDrive Startup Task-*` login tasks. It does not disable OneDrive update/reporting tasks or delete synced data.
@@ -57,6 +58,12 @@ When blocking OneDrive, Liberty first checks the current-user and local-machine 
 
 The feature does not touch OneDrive sync folders, update/reporting tasks, or enterprise policy. If a component cannot be changed, Liberty rolls back the partial block and reports the failure.
 
+## Startup manager safety model
+
+The startup manager is intentionally opt-in. Scanning is read-only; protected Windows/Defender entries are visible but cannot be selected. **Select risks** highlights launcher/updater/script/duplicate-chain entries so they can be reviewed before **Block selected**. A second warning appears for chain-risk, high-risk, or third-party entries. User-level changes are applied directly; machine registry entries, tasks, and services use UAC. Services are changed only from automatic to disabled and are never stopped by Liberty.
+
+Every blocked registry value keeps its original bytes and registry type. Folder shortcuts keep their original path and are moved to a Liberty backup directory. Tasks keep their enabled state, and services keep their original start type. **Restore selected** reverses the change. Liberty does not modify Winlogon Shell, BootExecute, AppInit DLLs, drivers, Defender services, or enterprise policies; those locations are treated as protected/advanced surfaces rather than blindly changed.
+
 ## Cleanup safety model
 
 The scanner asks Windows' built-in `IEmptyVolumeCache` / `IEmptyVolumeCache2` handlers for space estimates and purge operations. It validates handler DLLs against Windows system locations, re-scans after cleaning, leaves locked files to Windows, and requests UAC only for categories that need it. It intentionally does not implement registry cleaning, Storage Sense policy changes, or broad user-file deletion.
@@ -79,7 +86,9 @@ This project is released under the [MIT License](LICENSE). The overlay interacti
 
 ## Liberty（中文说明）
 
-Liberty 是面向 Windows 10/11 x64 的原生 C++/Win32 便携工具。右键托盘图标可以打开更大、更易读的 Windows 11 风格菜单，并在中文和 English 之间切换。工具包含快捷键映射、定时关机、桌面截图保存、OneDrive 自动启动阻止、NVIDIA/AMD 面板启动隐藏、Windows Security 托盘入口隐藏、桌面图片悬浮，以及基于 Windows 内置清理处理器的 DPI 自适应缓存清理窗口。
+Liberty 是面向 Windows 10/11 x64 的原生 C++/Win32 便携工具。右键托盘图标可以打开更大、更易读的 Windows 11 风格菜单，并在中文和 English 之间切换。工具包含快捷键映射、定时关机、桌面截图保存、启动项管理、OneDrive 自动启动阻止、NVIDIA/AMD 面板启动隐藏、Windows Security 托盘入口隐藏、桌面图片悬浮，以及基于 Windows 内置清理处理器的 DPI 自适应缓存清理窗口。
+
+启动项管理会扫描 Run/RunOnce/RunOnceEx、旧式 run/load、启动文件夹、登录任务和自动启动服务。它会标记启动器、更新器、脚本、重复唤醒链、临时目录和常见第三方后台助手；“选择风险项”只做选择，不会自动禁用，确认后才会执行。系统保护项保持只读，所有实际修改都支持恢复。
 
 OneDrive 功能只处理当前用户的启动入口和登录任务，并保存原始状态以便恢复；不会删除同步文件，不会关闭更新任务，也不会覆盖企业策略。清理功能默认只选择低风险缓存，高风险项目必须手动勾选并二次确认，不清理注册表、不删除 Documents 或 OneDrive 文件。
 

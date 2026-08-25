@@ -50,6 +50,7 @@ constexpr wchar_t kWindowClass[] = L"Liberty.TrayWindow";
 constexpr wchar_t kMenuClass[] = L"Liberty.ModernMenu";
 constexpr wchar_t kOverlayClass[] = L"Liberty.ImageOverlay";
 constexpr wchar_t kCleanupClass[] = L"Liberty.CleanupWindow";
+constexpr wchar_t kStartupClass[] = L"Liberty.StartupManager";
 constexpr wchar_t kAboutClass[] = L"Liberty.AboutWindow";
 constexpr wchar_t kUiFontProperty[] = L"Liberty.UiFont";
 constexpr wchar_t kRegistryKey[] = L"Software\\Liberty";
@@ -66,6 +67,8 @@ constexpr wchar_t kVolumeCachesKey[] =
 constexpr UINT kTrayMessage = WM_APP + 1;
 constexpr UINT kCleanupScanComplete = WM_APP + 3;
 constexpr UINT kCleanupRunComplete = WM_APP + 4;
+constexpr UINT kStartupScanComplete = WM_APP + 6;
+constexpr UINT kStartupApplyComplete = WM_APP + 7;
 constexpr UINT_PTR kOneDriveRefreshTimer = 5;
 constexpr ULONG_PTR kInjectedMarker = 0x4C494245525459ULL;
 
@@ -81,6 +84,7 @@ enum Command : UINT {
     ID_SHUTDOWN_CANCEL,
     ID_STARTUP,
     ID_MAPPINGS,
+    ID_STARTUP_MANAGER,
     ID_MENU_LANGUAGE,
     ID_BLOCK_ONEDRIVE,
     ID_HIDE_NVIDIA,
@@ -115,7 +119,19 @@ enum CleanupControl : int {
     ID_CLEANUP_CANCEL
 };
 
+enum StartupControl : int {
+    ID_STARTUP_LIST = 2300,
+    ID_STARTUP_STATUS,
+    ID_STARTUP_SCAN,
+    ID_STARTUP_SELECT_RISK,
+    ID_STARTUP_BLOCK,
+    ID_STARTUP_RESTORE,
+    ID_STARTUP_CANCEL
+};
+
 enum class AppLanguage : DWORD { English = 0, Chinese = 1, Auto = 2 };
+
+enum class ManagedStartupKind { Registry, StartupFolder, ScheduledTask, Service };
 
 struct ModifierChoice {
     WORD virtualKey;
@@ -176,11 +192,43 @@ struct CleanupRunResult {
     std::wstring message;
 };
 
+struct StartupItem {
+    ManagedStartupKind kind = ManagedStartupKind::Registry;
+    std::wstring id;
+    std::wstring name;
+    std::wstring source;
+    std::wstring command;
+    std::wstring location;
+    std::wstring registrySubKey;
+    std::wstring registryValueName;
+    std::wstring filePath;
+    std::wstring taskPath;
+    std::wstring serviceName;
+    HKEY registryRoot = nullptr;
+    REGSAM registryView = 0;
+    DWORD serviceStartType = SERVICE_NO_CHANGE;
+    bool enabled = true;
+    bool requiresElevation = false;
+    bool chainRisk = false;
+    bool highRisk = false;
+    bool thirdParty = false;
+    bool protectedItem = false;
+};
+
+struct StartupScanResult { std::vector<StartupItem> items; };
+
+struct StartupApplyResult {
+    bool success = false;
+    size_t changed = 0;
+    std::wstring message;
+};
+
 HINSTANCE g_instance = nullptr;
 HWND g_window = nullptr;
 HWND g_menuWindow = nullptr;
 HWND g_overlayWindow = nullptr;
 HWND g_cleanupWindow = nullptr;
+HWND g_startupWindow = nullptr;
 HWND g_aboutWindow = nullptr;
 HHOOK g_hook = nullptr;
 HANDLE g_mutex = nullptr;
@@ -206,6 +254,7 @@ AppLanguage g_language = AppLanguage::English;
 AppLanguage g_languageSetting = AppLanguage::Auto;
 OverlayState g_overlay{};
 std::vector<CleanupItem> g_cleanupItems;
+std::vector<StartupItem> g_startupItems;
 int g_menuHover = -1;
 int g_menuSelected = -1;
 int g_menuScroll = 0;
@@ -246,6 +295,7 @@ bool IsDarkTheme();
 void SetDarkMode(HWND window, bool dark);
 void UpdateTrayTip();
 void CloseOverlay();
+void ShowStartupWindow(HWND owner);
 
 std::wstring Lower(std::wstring value) {
     std::transform(value.begin(), value.end(), value.begin(), [](wchar_t character) {
@@ -408,6 +458,161 @@ bool DeleteRegistryValue(HKEY root, const wchar_t* subKey, const wchar_t* name) 
     const LONG result = RegDeleteValueW(key, name);
     RegCloseKey(key);
     return result == ERROR_SUCCESS || result == ERROR_FILE_NOT_FOUND;
+}
+
+constexpr wchar_t kStartupBackupKey[] = L"Software\\Liberty\\StartupManager\\Backups";
+
+std::wstring StartupRegistryViewLabel(REGSAM view);
+std::wstring StartupRegistryRootLabel(HKEY root);
+std::wstring StartupBackupName(const StartupItem& item, const wchar_t* suffix);
+bool HasStartupBackup(const StartupItem& item);
+void ClassifyStartupItem(StartupItem& item);
+
+bool SaveStartupDword(const wchar_t* name, DWORD value) {
+    return WriteRegistryDword(HKEY_CURRENT_USER, kStartupBackupKey, name, value);
+}
+
+DWORD LoadStartupDword(const wchar_t* name, DWORD fallback) {
+    DWORD value = fallback;
+    if (!ReadRegistryDword(HKEY_CURRENT_USER, kStartupBackupKey, name, value)) value = fallback;
+    return value;
+}
+
+bool SaveStartupString(const wchar_t* name, const std::wstring& value) {
+    return WriteRegistryString(HKEY_CURRENT_USER, kStartupBackupKey, name, value);
+}
+
+bool LoadStartupString(const wchar_t* name, std::wstring& value) {
+    return ReadRegistryString(HKEY_CURRENT_USER, kStartupBackupKey, name, value);
+}
+
+bool SaveStartupMetadata(const StartupItem& item) {
+    const std::vector<std::wstring> values = {
+        std::to_wstring(static_cast<int>(item.kind)), item.id, item.name, item.source,
+        item.command, item.location, item.registrySubKey, item.registryValueName,
+        item.filePath, item.taskPath, item.serviceName, StartupRegistryRootLabel(item.registryRoot),
+        StartupRegistryViewLabel(item.registryView), std::to_wstring(item.serviceStartType)
+    };
+    return WriteRegistryMultiSz(HKEY_CURRENT_USER, kStartupBackupKey,
+                                StartupBackupName(item, L"_Meta").c_str(), values);
+}
+
+bool LoadStartupMetadata(const wchar_t* valueName, StartupItem& item) {
+    std::vector<std::wstring> values;
+    if (!ReadRegistryMultiSz(HKEY_CURRENT_USER, kStartupBackupKey, valueName, values) || values.size() < 14) return false;
+    item.kind = static_cast<ManagedStartupKind>(_wtoi(values[0].c_str()));
+    item.id = values[1]; item.name = values[2]; item.source = values[3]; item.command = values[4];
+    item.location = values[5]; item.registrySubKey = values[6]; item.registryValueName = values[7];
+    item.filePath = values[8]; item.taskPath = values[9]; item.serviceName = values[10];
+    item.registryRoot = values[11] == L"HKLM" ? HKEY_LOCAL_MACHINE : HKEY_CURRENT_USER;
+    item.registryView = values[12] == L"32-bit" ? KEY_WOW64_32KEY : values[12] == L"64-bit" ? KEY_WOW64_64KEY : 0;
+    item.serviceStartType = wcstoul(values[13].c_str(), nullptr, 10);
+    item.requiresElevation = item.registryRoot == HKEY_LOCAL_MACHINE ||
+                             item.kind == ManagedStartupKind::ScheduledTask || item.kind == ManagedStartupKind::Service;
+    item.enabled = false;
+    ClassifyStartupItem(item);
+    return HasStartupBackup(item);
+}
+
+void MergeStartupBackupItems(std::vector<StartupItem>& result) {
+    HKEY key = nullptr;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, kStartupBackupKey, 0, KEY_READ, &key) != ERROR_SUCCESS) return;
+    DWORD maxName = 0;
+    RegQueryInfoKeyW(key, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, &maxName, nullptr, nullptr, nullptr);
+    std::vector<wchar_t> valueName(maxName + 2, L'\0');
+    DWORD index = 0;
+    while (true) {
+        DWORD nameLength = static_cast<DWORD>(valueName.size() - 1);
+        DWORD type = 0, dataSize = 0;
+        LONG status = RegEnumValueW(key, index++, valueName.data(), &nameLength, nullptr, &type, nullptr, &dataSize);
+        if (status == ERROR_NO_MORE_ITEMS) break;
+        if ((status != ERROR_SUCCESS && status != ERROR_MORE_DATA) || type != REG_MULTI_SZ) continue;
+        const std::wstring name(valueName.data(), nameLength);
+        if (name.size() < 5 || name.substr(name.size() - 5) != L"_Meta") continue;
+        StartupItem item;
+        if (!LoadStartupMetadata(name.c_str(), item)) continue;
+        const bool exists = std::any_of(result.begin(), result.end(), [&item](const StartupItem& current) { return current.id == item.id; });
+        if (!exists) result.push_back(std::move(item));
+    }
+    RegCloseKey(key);
+}
+
+bool ReadRawRegistryValue(HKEY root, const std::wstring& subKey, const std::wstring& name,
+                          REGSAM view, std::vector<BYTE>& data, DWORD& type) {
+    HKEY key = nullptr;
+    if (RegOpenKeyExW(root, subKey.c_str(), 0, KEY_QUERY_VALUE | view, &key) != ERROR_SUCCESS) return false;
+    DWORD size = 0;
+    LONG result = RegQueryValueExW(key, name.c_str(), nullptr, &type, nullptr, &size);
+    if (result != ERROR_SUCCESS) { RegCloseKey(key); return false; }
+    data.resize(size);
+    result = RegQueryValueExW(key, name.c_str(), nullptr, &type, data.data(), &size);
+    RegCloseKey(key);
+    return result == ERROR_SUCCESS;
+}
+
+bool WriteRawRegistryValue(HKEY root, const std::wstring& subKey, const std::wstring& name,
+                           REGSAM view, DWORD type, const std::vector<BYTE>& data) {
+    HKEY key = nullptr;
+    if (RegCreateKeyExW(root, subKey.c_str(), 0, nullptr, 0, KEY_SET_VALUE | view,
+                        nullptr, &key, nullptr) != ERROR_SUCCESS) return false;
+    const LONG result = RegSetValueExW(key, name.c_str(), 0, type, data.data(),
+                                       static_cast<DWORD>(data.size()));
+    RegCloseKey(key);
+    return result == ERROR_SUCCESS;
+}
+
+std::wstring StartupHash(const std::wstring& value) {
+    uint64_t hash = 1469598103934665603ULL;
+    for (wchar_t character : value) {
+        hash ^= static_cast<uint16_t>(character);
+        hash *= 1099511628211ULL;
+    }
+    wchar_t buffer[32]{};
+    swprintf_s(buffer, L"%016llX", static_cast<unsigned long long>(hash));
+    return buffer;
+}
+
+std::wstring StartupBackupName(const StartupItem& item, const wchar_t* suffix) {
+    return StartupHash(item.id) + suffix;
+}
+
+bool HasStartupBackup(const StartupItem& item) {
+    return LoadStartupDword(StartupBackupName(item, L"_Valid").c_str(), 0) != 0;
+}
+
+bool SaveStartupRawBackup(const StartupItem& item, DWORD type, const std::vector<BYTE>& data) {
+    std::vector<BYTE> blob(sizeof(DWORD) * 2 + data.size());
+    const DWORD size = static_cast<DWORD>(data.size());
+    memcpy(blob.data(), &type, sizeof(type));
+    memcpy(blob.data() + sizeof(type), &size, sizeof(size));
+    if (!data.empty()) memcpy(blob.data() + sizeof(type) * 2, data.data(), data.size());
+    if (!WriteRegistryBinary(HKEY_CURRENT_USER, kStartupBackupKey,
+                             StartupBackupName(item, L"_Raw").c_str(), blob)) return false;
+    SaveStartupDword(StartupBackupName(item, L"_Valid").c_str(), 1);
+    return true;
+}
+
+bool LoadStartupRawBackup(const StartupItem& item, DWORD& type, std::vector<BYTE>& data) {
+    std::vector<BYTE> blob;
+    if (!ReadRegistryBinary(HKEY_CURRENT_USER, kStartupBackupKey,
+                            StartupBackupName(item, L"_Raw").c_str(), blob) || blob.size() < sizeof(DWORD) * 2) return false;
+    DWORD size = 0;
+    memcpy(&type, blob.data(), sizeof(type));
+    memcpy(&size, blob.data() + sizeof(type), sizeof(size));
+    if (blob.size() != sizeof(DWORD) * 2 + size) return false;
+    data.assign(blob.begin() + sizeof(DWORD) * 2, blob.end());
+    return true;
+}
+
+void ClearStartupBackup(const StartupItem& item) {
+    DeleteRegistryValue(HKEY_CURRENT_USER, kStartupBackupKey, StartupBackupName(item, L"_Raw").c_str());
+    DeleteRegistryValue(HKEY_CURRENT_USER, kStartupBackupKey, StartupBackupName(item, L"_Folder").c_str());
+    DeleteRegistryValue(HKEY_CURRENT_USER, kStartupBackupKey, StartupBackupName(item, L"_FolderOriginal").c_str());
+    DeleteRegistryValue(HKEY_CURRENT_USER, kStartupBackupKey, StartupBackupName(item, L"_FolderBackup").c_str());
+    DeleteRegistryValue(HKEY_CURRENT_USER, kStartupBackupKey, StartupBackupName(item, L"_ServiceType").c_str());
+    DeleteRegistryValue(HKEY_CURRENT_USER, kStartupBackupKey, StartupBackupName(item, L"_TaskEnabled").c_str());
+    DeleteRegistryValue(HKEY_CURRENT_USER, kStartupBackupKey, StartupBackupName(item, L"_Meta").c_str());
+    SaveStartupDword(StartupBackupName(item, L"_Valid").c_str(), 0);
 }
 
 void SaveDword(const wchar_t* name, DWORD value) {
@@ -1073,7 +1278,7 @@ std::vector<TaskSnapshot> FindOneDriveTasks(bool* querySucceeded = nullptr) {
     return result;
 }
 
-bool SetOneDriveTaskEnabled(const std::wstring& path, bool enabled) {
+bool SetScheduledTaskEnabled(const std::wstring& path, bool enabled) {
     ComPtr<ITaskService> service; ComPtr<ITaskFolder> root;
     if (!ConnectTaskScheduler(service, root)) return false;
     BSTR taskPath = SysAllocString(path.c_str());
@@ -1081,6 +1286,10 @@ bool SetOneDriveTaskEnabled(const std::wstring& path, bool enabled) {
     const HRESULT result = root->GetTask(taskPath, task.put());
     SysFreeString(taskPath);
     return SUCCEEDED(result) && SUCCEEDED(task->put_Enabled(enabled ? VARIANT_TRUE : VARIANT_FALSE));
+}
+
+bool SetOneDriveTaskEnabled(const std::wstring& path, bool enabled) {
+    return SetScheduledTaskEnabled(path, enabled);
 }
 
 bool SaveTaskBackups(const std::vector<TaskSnapshot>& tasks) {
@@ -1114,6 +1323,377 @@ bool ApplyOneDriveTasks(bool blocked) {
     for (const TaskSnapshot& task : LoadTaskBackups()) if (!SetOneDriveTaskEnabled(task.path, task.enabled)) success = false;
     if (success) { DeleteRegistryValue(HKEY_CURRENT_USER, kRegistryKey, L"OneDriveTaskBackups"); SaveDword(L"OneDriveTaskBackupValid", 0); }
     return success;
+}
+
+std::wstring StartupExecutableToken(const std::wstring& command);
+bool StartupCommandContains(const std::wstring& command, std::initializer_list<const wchar_t*> needles);
+bool IsProtectedStartupCommand(const std::wstring& command, const std::wstring& name = {});
+void ClassifyStartupItem(StartupItem& item);
+void ScanStartupRegistry(std::vector<StartupItem>& result);
+void ScanStartupFolder(const std::wstring& folder, const wchar_t* source, bool requiresElevation,
+                       std::vector<StartupItem>& result);
+
+bool GetTaskStartupCommand(IRegisteredTask* task, std::wstring& command) {
+    ComPtr<ITaskDefinition> definition;
+    if (FAILED(task->get_Definition(definition.put()))) return false;
+    ComPtr<ITriggerCollection> triggers;
+    if (FAILED(definition->get_Triggers(triggers.put()))) return false;
+    LONG triggerCount = 0;
+    triggers->get_Count(&triggerCount);
+    bool startupTrigger = false;
+    for (LONG index = 1; index <= triggerCount; ++index) {
+        ComPtr<ITrigger> trigger;
+        if (FAILED(triggers->get_Item(index, trigger.put()))) continue;
+        TASK_TRIGGER_TYPE2 type{};
+        if (SUCCEEDED(trigger->get_Type(&type)) && (type == TASK_TRIGGER_LOGON || type == TASK_TRIGGER_BOOT)) {
+            startupTrigger = true;
+            break;
+        }
+    }
+    if (!startupTrigger) return false;
+    ComPtr<IActionCollection> actions;
+    if (FAILED(definition->get_Actions(actions.put()))) return false;
+    LONG actionCount = 0;
+    actions->get_Count(&actionCount);
+    for (LONG index = 1; index <= actionCount; ++index) {
+        ComPtr<IAction> action;
+        if (FAILED(actions->get_Item(index, action.put()))) continue;
+        TASK_ACTION_TYPE actionType{};
+        if (FAILED(action->get_Type(&actionType)) || actionType != TASK_ACTION_EXEC) continue;
+        ComPtr<IExecAction> exec;
+        if (FAILED(action->QueryInterface(__uuidof(IExecAction), reinterpret_cast<void**>(exec.put())))) continue;
+        BSTR path = nullptr; BSTR arguments = nullptr;
+        exec->get_Path(&path); exec->get_Arguments(&arguments);
+        command = BstrText(path);
+        if (arguments && *arguments) command += L" " + BstrText(arguments);
+        if (path) SysFreeString(path);
+        if (arguments) SysFreeString(arguments);
+        return !command.empty();
+    }
+    return false;
+}
+
+void ScanStartupTaskFolder(ITaskFolder* folder, std::vector<StartupItem>& result, int depth = 0) {
+    if (!folder || depth > 8) return;
+    ComPtr<IRegisteredTaskCollection> tasks;
+    if (FAILED(folder->GetTasks(TASK_ENUM_HIDDEN, tasks.put()))) return;
+    LONG count = 0; tasks->get_Count(&count);
+    for (LONG index = 1; index <= count; ++index) {
+        VARIANT itemIndex{}; itemIndex.vt = VT_I4; itemIndex.lVal = index;
+        ComPtr<IRegisteredTask> task;
+        if (FAILED(tasks->get_Item(itemIndex, task.put()))) continue;
+        std::wstring command;
+        if (!GetTaskStartupCommand(task.get(), command)) continue;
+        BSTR path = nullptr; BSTR name = nullptr; VARIANT_BOOL enabled = VARIANT_TRUE;
+        task->get_Path(&path); task->get_Name(&name); task->get_Enabled(&enabled);
+        StartupItem item;
+        item.kind = ManagedStartupKind::ScheduledTask;
+        item.taskPath = BstrText(path);
+        item.id = L"TASK|" + item.taskPath;
+        item.name = BstrText(name);
+        item.source = T(L"Logon task", L"登录任务");
+        item.location = item.taskPath;
+        item.command = command;
+        item.requiresElevation = true;
+        item.enabled = enabled != VARIANT_FALSE && !HasStartupBackup(item);
+        item.protectedItem = ContainsInsensitive(item.taskPath, L"\\Microsoft\\Windows\\") ||
+                             ContainsInsensitive(item.name, L"Windows");
+        ClassifyStartupItem(item);
+        result.push_back(std::move(item));
+        if (path) SysFreeString(path);
+        if (name) SysFreeString(name);
+    }
+    ComPtr<ITaskFolderCollection> folders;
+    if (FAILED(folder->GetFolders(TASK_ENUM_HIDDEN, folders.put()))) return;
+    LONG folderCount = 0; folders->get_Count(&folderCount);
+    for (LONG index = 1; index <= folderCount; ++index) {
+        VARIANT itemIndex{}; itemIndex.vt = VT_I4; itemIndex.lVal = index;
+        ComPtr<ITaskFolder> child;
+        if (SUCCEEDED(folders->get_Item(itemIndex, child.put()))) ScanStartupTaskFolder(child.get(), result, depth + 1);
+    }
+}
+
+void ScanStartupTasks(std::vector<StartupItem>& result) {
+    ComPtr<ITaskService> service; ComPtr<ITaskFolder> root;
+    if (ConnectTaskScheduler(service, root)) ScanStartupTaskFolder(root.get(), result);
+}
+
+bool IsProtectedService(const std::wstring& name, const std::wstring& command) {
+    return IsProtectedStartupCommand(command, name) ||
+           StartupCommandContains(name, {L"wuauserv", L"bits", L"WinDefend", L"WdNisSvc", L"SecurityHealth", L"RpcSs", L"DcomLaunch", L"PlugPlay", L"EventLog"});
+}
+
+void ScanStartupServices(std::vector<StartupItem>& result) {
+    SC_HANDLE manager = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_ENUMERATE_SERVICE);
+    if (!manager) return;
+    DWORD bytesNeeded = 0, serviceCount = 0, resume = 0;
+    EnumServicesStatusExW(manager, SC_ENUM_PROCESS_INFO, SERVICE_WIN32, SERVICE_STATE_ALL,
+                          nullptr, 0, &bytesNeeded, &serviceCount, &resume, nullptr);
+    if (!bytesNeeded) { CloseServiceHandle(manager); return; }
+    std::vector<BYTE> buffer(bytesNeeded + 4096);
+    if (!EnumServicesStatusExW(manager, SC_ENUM_PROCESS_INFO, SERVICE_WIN32, SERVICE_STATE_ALL,
+                               buffer.data(), static_cast<DWORD>(buffer.size()), &bytesNeeded,
+                               &serviceCount, &resume, nullptr)) { CloseServiceHandle(manager); return; }
+    auto* services = reinterpret_cast<ENUM_SERVICE_STATUS_PROCESSW*>(buffer.data());
+    for (DWORD index = 0; index < serviceCount; ++index) {
+        SC_HANDLE service = OpenServiceW(manager, services[index].lpServiceName, SERVICE_QUERY_CONFIG);
+        if (!service) continue;
+        DWORD needed = 0;
+        QueryServiceConfigW(service, nullptr, 0, &needed);
+        if (!needed) { CloseServiceHandle(service); continue; }
+        std::vector<BYTE> configBuffer(needed);
+        auto* config = reinterpret_cast<QUERY_SERVICE_CONFIGW*>(configBuffer.data());
+        if (!QueryServiceConfigW(service, config, needed, &needed)) { CloseServiceHandle(service); continue; }
+        StartupItem item;
+        item.kind = ManagedStartupKind::Service;
+        item.serviceName = services[index].lpServiceName;
+        item.id = L"SERVICE|" + item.serviceName;
+        item.name = config->lpDisplayName ? config->lpDisplayName : item.serviceName;
+        item.source = T(L"Service", L"服务");
+        item.location = item.serviceName;
+        item.command = config->lpBinaryPathName ? config->lpBinaryPathName : L"";
+        item.serviceStartType = config->dwStartType;
+        item.requiresElevation = true;
+        item.enabled = config->dwStartType == SERVICE_AUTO_START && !HasStartupBackup(item);
+        item.protectedItem = IsProtectedService(item.serviceName, item.command);
+        ClassifyStartupItem(item);
+        if (config->dwStartType == SERVICE_AUTO_START || HasStartupBackup(item)) result.push_back(std::move(item));
+        CloseServiceHandle(service);
+    }
+    CloseServiceHandle(manager);
+}
+
+std::vector<StartupItem> ScanStartupItems() {
+    std::vector<StartupItem> result;
+    ScanStartupRegistry(result);
+    ScanStartupFolder(GetKnownFolder(FOLDERID_Startup), T(L"User Startup folder", L"用户启动文件夹"), false, result);
+    ScanStartupFolder(GetKnownFolder(FOLDERID_CommonStartup), T(L"Common Startup folder", L"公共启动文件夹"), true, result);
+    ScanStartupTasks(result);
+    ScanStartupServices(result);
+    MergeStartupBackupItems(result);
+    for (size_t left = 0; left < result.size(); ++left) {
+        const std::wstring leftExecutable = StartupExecutableToken(result[left].command);
+        if (leftExecutable.empty()) continue;
+        for (size_t right = 0; right < result.size(); ++right) {
+            if (left == right) continue;
+            const std::wstring rightExecutable = StartupExecutableToken(result[right].command);
+            if (!rightExecutable.empty() && (leftExecutable == rightExecutable ||
+                ContainsInsensitive(result[left].command, rightExecutable.c_str()))) {
+                result[left].chainRisk = true;
+                break;
+            }
+        }
+    }
+    std::sort(result.begin(), result.end(), [](const StartupItem& left, const StartupItem& right) {
+        if (left.protectedItem != right.protectedItem) return !left.protectedItem;
+        if (left.highRisk != right.highRisk) return left.highRisk > right.highRisk;
+        return Lower(left.name) < Lower(right.name);
+    });
+    return result;
+}
+
+bool ApplyStartupRegistryItem(const StartupItem& item, bool block) {
+    const bool hasBackup = HasStartupBackup(item);
+    if (block) {
+        if (!hasBackup) {
+            std::vector<BYTE> data; DWORD type = 0;
+            if (!ReadRawRegistryValue(item.registryRoot, item.registrySubKey, item.registryValueName,
+                                      item.registryView, data, type)) return true;
+            if (!SaveStartupRawBackup(item, type, data) || !SaveStartupMetadata(item)) return false;
+        }
+        return DeleteRegistryValue(item.registryRoot, item.registrySubKey.c_str(), item.registryValueName.c_str());
+    }
+    if (!hasBackup) return true;
+    std::vector<BYTE> current; DWORD currentType = 0;
+    if (ReadRawRegistryValue(item.registryRoot, item.registrySubKey, item.registryValueName,
+                             item.registryView, current, currentType)) {
+        ClearStartupBackup(item);
+        return true;
+    }
+    DWORD type = 0; std::vector<BYTE> data;
+    if (!LoadStartupRawBackup(item, type, data)) return false;
+    if (!WriteRawRegistryValue(item.registryRoot, item.registrySubKey, item.registryValueName,
+                               item.registryView, type, data)) return false;
+    ClearStartupBackup(item);
+    return true;
+}
+
+bool ApplyStartupFolderItem(const StartupItem& item, bool block) {
+    const bool hasBackup = HasStartupBackup(item);
+    if (block) {
+        if (hasBackup) return true;
+        if (GetFileAttributesW(item.filePath.c_str()) == INVALID_FILE_ATTRIBUTES) return true;
+        const std::wstring local = GetKnownFolder(FOLDERID_LocalAppData);
+        const std::wstring directory = local + L"\\Liberty\\StartupManager\\FolderBackup";
+        CreateDirectoryW((local + L"\\Liberty").c_str(), nullptr);
+        CreateDirectoryW((local + L"\\Liberty\\StartupManager").c_str(), nullptr);
+        CreateDirectoryW(directory.c_str(), nullptr);
+        const size_t dot = item.filePath.find_last_of(L'.');
+        const std::wstring extension = dot == std::wstring::npos ? L".item" : item.filePath.substr(dot);
+        const std::wstring backup = directory + L"\\" + StartupHash(item.id) + extension;
+        if (!MoveFileExW(item.filePath.c_str(), backup.c_str(), MOVEFILE_REPLACE_EXISTING)) return false;
+        if (!SaveStartupString(StartupBackupName(item, L"_FolderOriginal").c_str(), item.filePath) ||
+            !SaveStartupString(StartupBackupName(item, L"_FolderBackup").c_str(), backup) ||
+            !SaveStartupMetadata(item)) {
+            MoveFileExW(backup.c_str(), item.filePath.c_str(), MOVEFILE_REPLACE_EXISTING);
+            ClearStartupBackup(item);
+            return false;
+        }
+        SaveStartupDword(StartupBackupName(item, L"_Valid").c_str(), 1);
+        return true;
+    }
+    if (!hasBackup) return true;
+    std::wstring original, backup;
+    if (!LoadStartupString(StartupBackupName(item, L"_FolderOriginal").c_str(), original) ||
+        !LoadStartupString(StartupBackupName(item, L"_FolderBackup").c_str(), backup)) return false;
+    if (GetFileAttributesW(original.c_str()) != INVALID_FILE_ATTRIBUTES) return false;
+    if (GetFileAttributesW(backup.c_str()) == INVALID_FILE_ATTRIBUTES) return false;
+    if (!MoveFileExW(backup.c_str(), original.c_str(), MOVEFILE_REPLACE_EXISTING)) return false;
+    ClearStartupBackup(item);
+    return true;
+}
+
+bool ApplyStartupTaskItem(const StartupItem& item, bool block) {
+    const bool hasBackup = HasStartupBackup(item);
+    if (block) {
+        if (!hasBackup) {
+            if (!SaveStartupDword(StartupBackupName(item, L"_TaskEnabled").c_str(), item.enabled ? 1 : 0) || !SaveStartupMetadata(item)) return false;
+            SaveStartupDword(StartupBackupName(item, L"_Valid").c_str(), 1);
+        }
+        return SetScheduledTaskEnabled(item.taskPath, false);
+    }
+    if (!hasBackup) return true;
+    const bool enabled = LoadStartupDword(StartupBackupName(item, L"_TaskEnabled").c_str(), 1) != 0;
+    if (!SetScheduledTaskEnabled(item.taskPath, enabled)) return false;
+    ClearStartupBackup(item);
+    return true;
+}
+
+bool ApplyStartupServiceItem(const StartupItem& item, bool block) {
+    const bool hasBackup = HasStartupBackup(item);
+    SC_HANDLE manager = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT);
+    if (!manager) return false;
+    SC_HANDLE service = OpenServiceW(manager, item.serviceName.c_str(), SERVICE_QUERY_CONFIG | SERVICE_CHANGE_CONFIG);
+    if (!service) { CloseServiceHandle(manager); return false; }
+    bool success = false;
+    if (block) {
+        if (!hasBackup) {
+            if (!SaveStartupDword(StartupBackupName(item, L"_ServiceType").c_str(), item.serviceStartType) || !SaveStartupMetadata(item)) goto done;
+            SaveStartupDword(StartupBackupName(item, L"_Valid").c_str(), 1);
+        }
+        success = ChangeServiceConfigW(service, SERVICE_NO_CHANGE, SERVICE_DISABLED, SERVICE_NO_CHANGE,
+                                       nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr) != FALSE;
+    } else if (hasBackup) {
+        const DWORD startType = LoadStartupDword(StartupBackupName(item, L"_ServiceType").c_str(), SERVICE_DEMAND_START);
+        success = ChangeServiceConfigW(service, SERVICE_NO_CHANGE, startType, SERVICE_NO_CHANGE,
+                                       nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr) != FALSE;
+        if (success) ClearStartupBackup(item);
+    } else success = true;
+done:
+    CloseServiceHandle(service);
+    CloseServiceHandle(manager);
+    return success;
+}
+
+bool ApplyStartupItem(const StartupItem& item, bool block) {
+    if (item.protectedItem) return false;
+    switch (item.kind) {
+    case ManagedStartupKind::Registry: return ApplyStartupRegistryItem(item, block);
+    case ManagedStartupKind::StartupFolder: return ApplyStartupFolderItem(item, block);
+    case ManagedStartupKind::ScheduledTask: return ApplyStartupTaskItem(item, block);
+    case ManagedStartupKind::Service: return ApplyStartupServiceItem(item, block);
+    }
+    return false;
+}
+
+bool ApplyStartupItems(const std::vector<StartupItem>& items, bool block, size_t& changed) {
+    changed = 0;
+    bool success = true;
+    for (const StartupItem& item : items) {
+        if (item.protectedItem) { success = false; continue; }
+        if (ApplyStartupItem(item, block)) ++changed;
+        else success = false;
+    }
+    return success;
+}
+
+struct StartupPlanEntry {
+    bool block = true;
+    std::wstring id;
+};
+
+bool WriteStartupPlan(const std::wstring& path, const std::vector<StartupPlanEntry>& entries) {
+    HANDLE file = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW,
+                               FILE_ATTRIBUTE_TEMPORARY, nullptr);
+    if (file == INVALID_HANDLE_VALUE) return false;
+    std::wstring content;
+    for (const StartupPlanEntry& entry : entries) content += (entry.block ? L"B\t" : L"R\t") + entry.id + L"\r\n";
+    DWORD written = 0;
+    const bool success = WriteFile(file, content.data(), static_cast<DWORD>(content.size() * sizeof(wchar_t)), &written, nullptr) != FALSE;
+    CloseHandle(file);
+    return success;
+}
+
+std::vector<StartupPlanEntry> ReadStartupPlan(const std::wstring& path) {
+    std::vector<StartupPlanEntry> result;
+    HANDLE file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                               FILE_ATTRIBUTE_TEMPORARY, nullptr);
+    if (file == INVALID_HANDLE_VALUE) return result;
+    LARGE_INTEGER size{};
+    if (!GetFileSizeEx(file, &size) || size.QuadPart <= 0 || size.QuadPart > 2 * 1024 * 1024) {
+        CloseHandle(file); return result;
+    }
+    std::vector<wchar_t> buffer(static_cast<size_t>(size.QuadPart / sizeof(wchar_t)) + 2, L'\0');
+    DWORD read = 0;
+    ReadFile(file, buffer.data(), static_cast<DWORD>(size.QuadPart), &read, nullptr);
+    CloseHandle(file);
+    std::wstring content(buffer.data(), read / sizeof(wchar_t));
+    size_t start = 0;
+    while (start < content.size()) {
+        const size_t end = content.find_first_of(L"\r\n", start);
+        const std::wstring line = content.substr(start, end == std::wstring::npos ? end : end - start);
+        if (line.size() > 2 && line[1] == L'\t' && (line[0] == L'B' || line[0] == L'R'))
+            result.push_back({line[0] == L'B', line.substr(2)});
+        if (end == std::wstring::npos) break;
+        start = end + 1;
+        while (start < content.size() && (content[start] == L'\r' || content[start] == L'\n')) ++start;
+    }
+    return result;
+}
+
+bool RunStartupPlan(const std::wstring& path, std::wstring& message) {
+    const std::vector<StartupPlanEntry> plan = ReadStartupPlan(path);
+    if (plan.empty()) { message = T(L"The startup plan was empty.", L"启动项计划为空。"); return false; }
+    const std::vector<StartupItem> items = ScanStartupItems();
+    size_t changed = 0;
+    bool success = true;
+    for (const StartupPlanEntry& entry : plan) {
+        auto match = std::find_if(items.begin(), items.end(), [&entry](const StartupItem& item) { return item.id == entry.id; });
+        if (match == items.end() || !ApplyStartupItem(*match, entry.block)) { success = false; continue; }
+        ++changed;
+    }
+    message = std::to_wstring(changed) + T(L" startup item(s) updated.", L" 个启动项已更新。");
+    return success;
+}
+
+bool RunElevatedStartupPlan(const std::vector<StartupPlanEntry>& entries) {
+    const std::wstring local = GetKnownFolder(FOLDERID_LocalAppData);
+    const std::wstring path = local + L"\\LibertyStartup-" + std::to_wstring(GetCurrentProcessId()) + L".txt";
+    if (!WriteStartupPlan(path, entries)) return false;
+    const std::wstring executable = GetModulePath();
+    const std::wstring parameters = L"--startup-apply \"" + path + L"\"";
+    SHELLEXECUTEINFOW execute{sizeof(execute)};
+    execute.fMask = SEE_MASK_NOCLOSEPROCESS;
+    execute.lpVerb = L"runas";
+    execute.lpFile = executable.c_str();
+    execute.lpParameters = parameters.c_str();
+    execute.nShow = SW_HIDE;
+    const bool launched = ShellExecuteExW(&execute) != FALSE;
+    if (!launched) { DeleteFileW(path.c_str()); return false; }
+    WaitForSingleObject(execute.hProcess, INFINITE);
+    DWORD exitCode = 1; GetExitCodeProcess(execute.hProcess, &exitCode);
+    CloseHandle(execute.hProcess); DeleteFileW(path.c_str());
+    return exitCode == 0;
 }
 
 bool IsCurrentUserProcess(HANDLE process) {
@@ -1187,6 +1767,186 @@ bool ApplyOneDriveBlock(bool blocked, bool stopRunning) {
     }
     if (blocked && stopRunning) StopRunningOneDrive();
     return success;
+}
+
+std::wstring StartupRegistryViewLabel(REGSAM view) {
+    if (view == KEY_WOW64_32KEY) return L"32-bit";
+    if (view == KEY_WOW64_64KEY) return L"64-bit";
+    return L"native";
+}
+
+std::wstring StartupRegistryRootLabel(HKEY root) {
+    return root == HKEY_LOCAL_MACHINE ? L"HKLM" : L"HKCU";
+}
+
+std::wstring RegistryDataText(DWORD type, const std::vector<BYTE>& data) {
+    if (data.empty()) return {};
+    if (type != REG_SZ && type != REG_EXPAND_SZ && type != REG_MULTI_SZ) return L"(non-text registry value)";
+    const size_t count = data.size() / sizeof(wchar_t);
+    const wchar_t* text = reinterpret_cast<const wchar_t*>(data.data());
+    if (type == REG_MULTI_SZ) {
+        std::wstring result;
+        for (size_t offset = 0; offset < count && text[offset]; ) {
+            if (!result.empty()) result += L" | ";
+            result += text + offset;
+            offset += wcslen(text + offset) + 1;
+        }
+        return result;
+    }
+    return std::wstring(text, wcsnlen_s(text, count));
+}
+
+std::wstring ExpandStartupCommand(const std::wstring& command) {
+    if (command.empty()) return {};
+    DWORD needed = ExpandEnvironmentStringsW(command.c_str(), nullptr, 0);
+    if (!needed) return command;
+    std::vector<wchar_t> buffer(needed + 1, L'\0');
+    ExpandEnvironmentStringsW(command.c_str(), buffer.data(), static_cast<DWORD>(buffer.size()));
+    return buffer.data();
+}
+
+std::wstring StartupExecutableToken(const std::wstring& command) {
+    std::wstring text = command;
+    while (!text.empty() && iswspace(text.front())) text.erase(text.begin());
+    if (text.empty()) return {};
+    std::wstring token;
+    if (text.front() == L'"') {
+        const size_t end = text.find(L'"', 1);
+        token = text.substr(1, end == std::wstring::npos ? end : end - 1);
+    } else {
+        const size_t end = text.find_first_of(L" \t");
+        token = text.substr(0, end);
+    }
+    const size_t slash = token.find_last_of(L"\\/");
+    return Lower(slash == std::wstring::npos ? token : token.substr(slash + 1));
+}
+
+bool StartupCommandContains(const std::wstring& command, std::initializer_list<const wchar_t*> needles) {
+    for (const wchar_t* needle : needles) if (ContainsInsensitive(command, needle)) return true;
+    return false;
+}
+
+bool IsProtectedStartupCommand(const std::wstring& command, const std::wstring& name) {
+    const std::wstring expanded = Lower(ExpandStartupCommand(command));
+    wchar_t windowsDirectory[MAX_PATH]{};
+    GetWindowsDirectoryW(windowsDirectory, ARRAYSIZE(windowsDirectory));
+    const std::wstring windowsPath = Lower(windowsDirectory);
+    if (!windowsPath.empty() && (expanded.rfind(windowsPath + L"\\", 0) == 0 || expanded.rfind(L"\"" + windowsPath + L"\\", 0) == 0)) return true;
+    return StartupCommandContains(expanded, {L"securityhealthsystray", L"msmpeng.exe", L"windefend", L"lsass.exe", L"services.exe", L"svchost.exe", L"explorer.exe", L"winlogon.exe"}) ||
+           StartupCommandContains(name, {L"Windows Defender", L"Windows Security", L"Microsoft Defender"});
+}
+
+void ClassifyStartupItem(StartupItem& item) {
+    const std::wstring combined = Lower(item.name + L" " + item.command + L" " + item.location);
+    item.thirdParty = StartupCommandContains(combined, {
+        L"腾讯", L"qq", L"wechat", L"微信", L"钉钉", L"企业微信", L"百度", L"爱奇艺", L"迅雷", L"360", L"搜狗", L"wps", L"金山", L"鲁大师", L"驱动精灵", L"字节", L"抖音", L"快手", L"网易", L"阿里", L"小米", L"华为", L"联想", L"oppo", L"vivo"
+    });
+    item.chainRisk = StartupCommandContains(combined, {
+        L"launcher", L"updater", L"update.exe", L"bootstrap", L"helper", L"startinstances", L"--background", L"/background", L"--silent", L"/silent", L"schtasks", L"rundll32", L"regsvr32", L"mshta", L"powershell", L"pwsh", L"wscript", L"cscript", L"cmd.exe /c", L".bat", L".cmd", L".vbs", L".js"
+    });
+    item.highRisk = StartupCommandContains(combined, {
+        L"\\appdata\\local\\temp\\", L"\\downloads\\", L"javascript:", L"-enc ", L"-encodedcommand", L"base64", L"rundll32", L"regsvr32", L"mshta"
+    });
+    item.protectedItem = item.protectedItem || IsProtectedStartupCommand(item.command, item.name);
+}
+
+std::wstring MakeRegistryStartupId(HKEY root, REGSAM view, const std::wstring& subKey, const std::wstring& valueName) {
+    return L"REG|" + StartupRegistryRootLabel(root) + L"|" + StartupRegistryViewLabel(view) + L"|" + subKey + L"|" + valueName;
+}
+
+void ScanStartupRegistryTree(HKEY root, const std::wstring& subKey, const wchar_t* source,
+                             REGSAM view, std::vector<StartupItem>& result, int depth = 0) {
+    HKEY key = nullptr;
+    if (RegOpenKeyExW(root, subKey.c_str(), 0, KEY_READ | view, &key) != ERROR_SUCCESS) return;
+    DWORD maxValueName = 0, maxValueData = 0, subKeyCount = 0, maxSubKey = 0;
+    RegQueryInfoKeyW(key, nullptr, nullptr, nullptr, &subKeyCount, &maxSubKey, nullptr,
+                     nullptr, &maxValueName, &maxValueData, nullptr, nullptr);
+    std::vector<wchar_t> valueName(maxValueName + 2, L'\0');
+    std::vector<BYTE> valueData(maxValueData + 2, 0);
+    for (DWORD index = 0; index < maxValueName + subKeyCount + 128; ++index) {
+        DWORD nameLength = static_cast<DWORD>(valueName.size() - 1);
+        DWORD dataSize = static_cast<DWORD>(valueData.size());
+        DWORD type = 0;
+        LONG status = RegEnumValueW(key, index, valueName.data(), &nameLength, nullptr, &type,
+                                    valueData.data(), &dataSize);
+        if (status == ERROR_NO_MORE_ITEMS) break;
+        if (status == ERROR_MORE_DATA) {
+            valueName.resize(valueName.size() * 2 + 2, L'\0');
+            valueData.resize(valueData.size() * 2 + 2, 0);
+            --index;
+            continue;
+        }
+        if (status != ERROR_SUCCESS || (type != REG_SZ && type != REG_EXPAND_SZ && type != REG_MULTI_SZ)) continue;
+        StartupItem item;
+        item.kind = ManagedStartupKind::Registry;
+        item.id = MakeRegistryStartupId(root, view, subKey, std::wstring(valueName.data(), nameLength));
+        item.name = std::wstring(valueName.data(), nameLength);
+        item.source = std::wstring(StartupRegistryRootLabel(root) + L" " + source + L" (" + StartupRegistryViewLabel(view) + L")");
+        item.registryRoot = root;
+        item.registryView = view;
+        item.registrySubKey = subKey;
+        item.registryValueName = item.name;
+        item.location = subKey + L"\\" + item.name;
+        item.command = RegistryDataText(type, valueData);
+        item.requiresElevation = root == HKEY_LOCAL_MACHINE;
+        item.enabled = !HasStartupBackup(item);
+        ClassifyStartupItem(item);
+        result.push_back(std::move(item));
+    }
+    if (depth < 3) {
+        std::vector<wchar_t> childName(maxSubKey + 2, L'\0');
+        for (DWORD index = 0; index < subKeyCount; ++index) {
+            DWORD childLength = static_cast<DWORD>(childName.size() - 1);
+            if (RegEnumKeyExW(key, index, childName.data(), &childLength, nullptr, nullptr, nullptr, nullptr) == ERROR_SUCCESS)
+                ScanStartupRegistryTree(root, subKey + L"\\" + std::wstring(childName.data(), childLength), source, view, result, depth + 1);
+        }
+    }
+    RegCloseKey(key);
+}
+
+void ScanStartupRegistry(std::vector<StartupItem>& result) {
+    struct RegistrySource { HKEY root; const wchar_t* key; const wchar_t* label; };
+    const RegistrySource sources[] = {
+        {HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Run", L"Run"},
+        {HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\RunOnce", L"RunOnce"},
+        {HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\RunOnceEx", L"RunOnceEx"},
+        {HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows NT\\CurrentVersion\\Windows", L"Windows run/load"},
+        {HKEY_LOCAL_MACHINE, L"Software\\Microsoft\\Windows\\CurrentVersion\\Run", L"Run"},
+        {HKEY_LOCAL_MACHINE, L"Software\\Microsoft\\Windows\\CurrentVersion\\RunOnce", L"RunOnce"},
+        {HKEY_LOCAL_MACHINE, L"Software\\Microsoft\\Windows\\CurrentVersion\\RunOnceEx", L"RunOnceEx"},
+        {HKEY_LOCAL_MACHINE, L"Software\\Microsoft\\Windows NT\\CurrentVersion\\Windows", L"Windows run/load"}
+    };
+    const REGSAM views[] = {KEY_WOW64_64KEY, KEY_WOW64_32KEY};
+    for (const RegistrySource& source : sources)
+        for (REGSAM view : views) ScanStartupRegistryTree(source.root, source.key, source.label, view, result);
+}
+
+void ScanStartupFolder(const std::wstring& folder, const wchar_t* source, bool requiresElevation,
+                       std::vector<StartupItem>& result) {
+    if (folder.empty()) return;
+    WIN32_FIND_DATAW data{};
+    const HANDLE find = FindFirstFileW((folder + L"\\*").c_str(), &data);
+    if (find == INVALID_HANDLE_VALUE) return;
+    do {
+        if (data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+        const std::wstring name = data.cFileName;
+        if (!ContainsInsensitive(name, L".lnk") && !ContainsInsensitive(name, L".url") &&
+            !ContainsInsensitive(name, L".exe") && !ContainsInsensitive(name, L".bat") &&
+            !ContainsInsensitive(name, L".cmd")) continue;
+        StartupItem item;
+        item.kind = ManagedStartupKind::StartupFolder;
+        item.filePath = folder + L"\\" + name;
+        item.id = L"FOLDER|" + item.filePath;
+        item.name = name;
+        item.source = T(source, source);
+        item.location = item.filePath;
+        item.command = item.filePath;
+        item.requiresElevation = requiresElevation;
+        item.enabled = !HasStartupBackup(item);
+        ClassifyStartupItem(item);
+        result.push_back(std::move(item));
+    } while (FindNextFileW(find, &data));
+    FindClose(find);
 }
 
 bool IsSecurityCenterHidden() {
@@ -1698,6 +2458,238 @@ void ShowCleanupWindow(HWND owner) {
     if (g_cleanupWindow) { ShowWindow(g_cleanupWindow, SW_SHOW); UpdateWindow(g_cleanupWindow); }
 }
 
+const wchar_t* StartupRiskLabel(const StartupItem& item) {
+    if (item.protectedItem) return T(L"Protected", L"系统保护");
+    if (item.highRisk && item.chainRisk) return T(L"High / chain", L"高风险/链式");
+    if (item.highRisk) return T(L"High risk", L"高风险");
+    if (item.chainRisk) return T(L"Chain wake", L"链式唤醒");
+    if (item.thirdParty) return T(L"Third-party", L"第三方软件");
+    return T(L"Review", L"可管理");
+}
+
+void PopulateStartupList(HWND list) {
+    ListView_DeleteAllItems(list);
+    for (size_t index = 0; index < g_startupItems.size(); ++index) {
+        const StartupItem& item = g_startupItems[index];
+        std::wstring name = item.name.empty() ? item.location : item.name;
+        if (!item.enabled && HasStartupBackup(item)) name += T(L"  [blocked by Liberty]", L"  [Liberty 已阻止]");
+        LVITEMW row{LVIF_TEXT, static_cast<int>(index), 0, 0, 0, const_cast<LPWSTR>(name.c_str()), 0, 0, 0};
+        ListView_InsertItem(list, &row);
+        ListView_SetItemText(list, static_cast<int>(index), 1, const_cast<LPWSTR>(item.source.c_str()));
+        ListView_SetItemText(list, static_cast<int>(index), 2, const_cast<LPWSTR>(item.command.c_str()));
+        ListView_SetItemText(list, static_cast<int>(index), 3, const_cast<LPWSTR>(StartupRiskLabel(item)));
+        ListView_SetCheckState(list, static_cast<int>(index), FALSE);
+    }
+}
+
+void LayoutStartupWindow(HWND window) {
+    if (!window) return;
+    const UINT dpi = GetWindowDpiSafe(window);
+    RECT client{}; GetClientRect(window, &client);
+    const int margin = ScaleUi(24, dpi);
+    const int statusTop = ScaleUi(14, dpi);
+    const int statusHeight = ScaleUi(32, dpi);
+    const int listTop = ScaleUi(62, dpi);
+    const int buttonHeight = ScaleUi(38, dpi);
+    const int bottomGap = ScaleUi(16, dpi);
+    const int listBottom = (std::max)(listTop + ScaleUi(140, dpi), static_cast<int>(client.bottom) - buttonHeight - bottomGap);
+    const int contentWidth = (std::max)(0, static_cast<int>(client.right) - margin * 2);
+    MoveWindow(GetDlgItem(window, ID_STARTUP_STATUS), margin, statusTop, contentWidth, statusHeight, TRUE);
+    MoveWindow(GetDlgItem(window, ID_STARTUP_LIST), margin, listTop, contentWidth,
+               (std::max)(0, listBottom - listTop), TRUE);
+
+    const int scanWidth = ScaleUi(148, dpi);
+    const int selectWidth = ScaleUi(154, dpi);
+    const int blockWidth = ScaleUi(160, dpi);
+    const int restoreWidth = ScaleUi(148, dpi);
+    const int closeWidth = ScaleUi(116, dpi);
+    const int gap = ScaleUi(12, dpi);
+    const int buttonY = (std::max)(listTop, static_cast<int>(client.bottom) - bottomGap - buttonHeight);
+    const int closeX = client.right - margin - closeWidth;
+    const int restoreX = closeX - gap - restoreWidth;
+    const int blockX = restoreX - gap - blockWidth;
+    const int selectX = blockX - gap - selectWidth;
+    MoveWindow(GetDlgItem(window, ID_STARTUP_SCAN), margin, buttonY, scanWidth, buttonHeight, TRUE);
+    MoveWindow(GetDlgItem(window, ID_STARTUP_SELECT_RISK), selectX, buttonY, selectWidth, buttonHeight, TRUE);
+    MoveWindow(GetDlgItem(window, ID_STARTUP_BLOCK), blockX, buttonY, blockWidth, buttonHeight, TRUE);
+    MoveWindow(GetDlgItem(window, ID_STARTUP_RESTORE), restoreX, buttonY, restoreWidth, buttonHeight, TRUE);
+    MoveWindow(GetDlgItem(window, ID_STARTUP_CANCEL), closeX, buttonY, closeWidth, buttonHeight, TRUE);
+
+    HWND list = GetDlgItem(window, ID_STARTUP_LIST);
+    if (list) {
+        const int sourceWidth = ScaleUi(164, dpi);
+        const int riskWidth = ScaleUi(144, dpi);
+        const int nameWidth = ScaleUi(250, dpi);
+        ListView_SetColumnWidth(list, 0, nameWidth);
+        ListView_SetColumnWidth(list, 1, sourceWidth);
+        ListView_SetColumnWidth(list, 2, (std::max)(ScaleUi(300, dpi), contentWidth - nameWidth - sourceWidth - riskWidth));
+        ListView_SetColumnWidth(list, 3, riskWidth);
+    }
+}
+
+void StartStartupScan(HWND window) {
+    SetDlgItemTextW(window, ID_STARTUP_STATUS,
+                    T(L"Scanning startup locations, tasks, and services…", L"正在扫描启动位置、登录任务和服务…"));
+    EnableWindow(GetDlgItem(window, ID_STARTUP_SCAN), FALSE);
+    EnableWindow(GetDlgItem(window, ID_STARTUP_SELECT_RISK), FALSE);
+    EnableWindow(GetDlgItem(window, ID_STARTUP_BLOCK), FALSE);
+    EnableWindow(GetDlgItem(window, ID_STARTUP_RESTORE), FALSE);
+    std::thread([window]() {
+        auto* result = new StartupScanResult;
+        CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+        result->items = ScanStartupItems();
+        CoUninitialize();
+        if (IsWindow(window)) PostMessageW(window, kStartupScanComplete, 0, reinterpret_cast<LPARAM>(result));
+        else delete result;
+    }).detach();
+}
+
+void ApplySelectedStartupItems(HWND window, bool block) {
+    HWND list = GetDlgItem(window, ID_STARTUP_LIST);
+    std::vector<StartupItem> selected;
+    std::vector<StartupPlanEntry> plan;
+    bool hasWarning = false;
+    bool needsElevation = false;
+    for (int index = 0; index < ListView_GetItemCount(list) && index < static_cast<int>(g_startupItems.size()); ++index) {
+        if (!ListView_GetCheckState(list, index)) continue;
+        const StartupItem& item = g_startupItems[static_cast<size_t>(index)];
+        if (item.protectedItem || (block ? !item.enabled : item.enabled)) continue;
+        selected.push_back(item);
+        plan.push_back({block, item.id});
+        needsElevation = needsElevation || item.requiresElevation;
+        hasWarning = hasWarning || item.chainRisk || item.highRisk || item.thirdParty;
+    }
+    if (selected.empty()) {
+        MessageBoxW(window, T(L"Select eligible startup items first.", L"请先选择可管理的启动项。"), kAppName, MB_OK | MB_ICONINFORMATION);
+        return;
+    }
+    if (block && hasWarning && MessageBoxW(window,
+        T(L"Some selected entries can relaunch through launchers, updaters, scripts, or third-party background helpers. Disable only entries you recognize. Continue?",
+          L"所选项目包含启动器、更新器、脚本、重复唤醒链或第三方后台助手。请确认你认识这些项目后再阻止。是否继续？"),
+        kAppName, MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != IDYES) return;
+
+    EnableWindow(GetDlgItem(window, ID_STARTUP_SCAN), FALSE);
+    EnableWindow(GetDlgItem(window, ID_STARTUP_SELECT_RISK), FALSE);
+    EnableWindow(GetDlgItem(window, ID_STARTUP_BLOCK), FALSE);
+    EnableWindow(GetDlgItem(window, ID_STARTUP_RESTORE), FALSE);
+    SetDlgItemTextW(window, ID_STARTUP_STATUS, block ? T(L"Blocking selected startup items…", L"正在阻止选中的启动项…") : T(L"Restoring selected startup items…", L"正在恢复选中的启动项…"));
+    std::thread([window, selected, plan, needsElevation]() {
+        auto* result = new StartupApplyResult;
+        if (needsElevation && !IsProcessElevated()) {
+            result->success = RunElevatedStartupPlan(plan);
+            result->changed = result->success ? plan.size() : 0;
+        } else {
+            result->success = ApplyStartupItems(selected, plan.front().block, result->changed);
+        }
+        result->message = result->success
+            ? std::to_wstring(result->changed) + T(L" startup item(s) updated.", L" 个启动项已更新。")
+            : T(L"Some entries could not be changed. Protected or locked items were left untouched.", L"部分项目无法修改；系统保护项或正在使用的项目已保留。");
+        if (IsWindow(window)) PostMessageW(window, kStartupApplyComplete, 0, reinterpret_cast<LPARAM>(result));
+        else delete result;
+    }).detach();
+}
+
+LRESULT CALLBACK StartupProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
+    switch (message) {
+    case WM_CREATE: {
+        SetDarkMode(window, IsDarkTheme());
+        CreateWindowExW(0, L"STATIC", T(L"Preparing…", L"正在准备…"), WS_CHILD | WS_VISIBLE,
+                        0, 0, 0, 0, window, reinterpret_cast<HMENU>(ID_STARTUP_STATUS), g_instance, nullptr);
+        HWND list = CreateWindowExW(WS_EX_CLIENTEDGE, WC_LISTVIEWW, nullptr,
+                                    WS_CHILD | WS_VISIBLE | LVS_REPORT | LVS_SINGLESEL | WS_VSCROLL,
+                                    0, 0, 0, 0, window, reinterpret_cast<HMENU>(ID_STARTUP_LIST), g_instance, nullptr);
+        ListView_SetExtendedListViewStyle(list, LVS_EX_CHECKBOXES | LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES | LVS_EX_DOUBLEBUFFER);
+        LVCOLUMNW column{LVCF_TEXT | LVCF_WIDTH, 0, 250, const_cast<LPWSTR>(T(L"Startup item", L"启动项"))};
+        ListView_InsertColumn(list, 0, &column);
+        column.cx = 164; column.pszText = const_cast<LPWSTR>(T(L"Source", L"来源")); ListView_InsertColumn(list, 1, &column);
+        column.cx = 360; column.pszText = const_cast<LPWSTR>(T(L"Command / target", L"命令/目标")); ListView_InsertColumn(list, 2, &column);
+        column.cx = 144; column.pszText = const_cast<LPWSTR>(T(L"Risk", L"风险")); ListView_InsertColumn(list, 3, &column);
+        CreateWindowExW(0, L"BUTTON", T(L"Scan again", L"重新扫描"), WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+                        0, 0, 0, 0, window, reinterpret_cast<HMENU>(ID_STARTUP_SCAN), g_instance, nullptr);
+        CreateWindowExW(0, L"BUTTON", T(L"Select risks", L"选择风险项"), WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+                        0, 0, 0, 0, window, reinterpret_cast<HMENU>(ID_STARTUP_SELECT_RISK), g_instance, nullptr);
+        CreateWindowExW(0, L"BUTTON", T(L"Block selected", L"阻止选中项"), WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+                        0, 0, 0, 0, window, reinterpret_cast<HMENU>(ID_STARTUP_BLOCK), g_instance, nullptr);
+        CreateWindowExW(0, L"BUTTON", T(L"Restore selected", L"恢复选中项"), WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+                        0, 0, 0, 0, window, reinterpret_cast<HMENU>(ID_STARTUP_RESTORE), g_instance, nullptr);
+        CreateWindowExW(0, L"BUTTON", T(L"Close", L"关闭"), WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+                        0, 0, 0, 0, window, reinterpret_cast<HMENU>(ID_STARTUP_CANCEL), g_instance, nullptr);
+        ApplyUiFont(window, 16);
+        LayoutStartupWindow(window);
+        StartStartupScan(window);
+        return 0;
+    }
+    case WM_SIZE: LayoutStartupWindow(window); return 0;
+    case WM_DPICHANGED:
+        if (const RECT* suggested = reinterpret_cast<const RECT*>(lParam))
+            SetWindowPos(window, nullptr, suggested->left, suggested->top,
+                         suggested->right - suggested->left, suggested->bottom - suggested->top,
+                         SWP_NOZORDER | SWP_NOACTIVATE);
+        ApplyUiFont(window, 16); LayoutStartupWindow(window); return 0;
+    case kStartupScanComplete: {
+        auto* result = reinterpret_cast<StartupScanResult*>(lParam);
+        g_startupItems = std::move(result->items); delete result;
+        PopulateStartupList(GetDlgItem(window, ID_STARTUP_LIST));
+        size_t chain = 0, high = 0, protectedCount = 0;
+        for (const StartupItem& item : g_startupItems) { chain += item.chainRisk; high += item.highRisk; protectedCount += item.protectedItem; }
+        std::wstring status = T(L"Found ", L"发现 ") + std::to_wstring(g_startupItems.size()) +
+            T(L" startup items; ", L" 个启动项；") + std::to_wstring(chain) +
+            T(L" chain-risk, ", L" 个链式风险，") + std::to_wstring(high) +
+            T(L" high-risk. Protected: ", L" 个高风险。系统保护：") + std::to_wstring(protectedCount);
+        SetDlgItemTextW(window, ID_STARTUP_STATUS, status.c_str());
+        EnableWindow(GetDlgItem(window, ID_STARTUP_SCAN), TRUE);
+        EnableWindow(GetDlgItem(window, ID_STARTUP_SELECT_RISK), TRUE);
+        EnableWindow(GetDlgItem(window, ID_STARTUP_BLOCK), TRUE);
+        EnableWindow(GetDlgItem(window, ID_STARTUP_RESTORE), TRUE);
+        return 0;
+    }
+    case kStartupApplyComplete: {
+        auto* result = reinterpret_cast<StartupApplyResult*>(lParam);
+        MessageBoxW(window, result->message.c_str(), kAppName,
+                    result->success ? MB_OK | MB_ICONINFORMATION : MB_OK | MB_ICONWARNING);
+        delete result; StartStartupScan(window); return 0;
+    }
+    case WM_COMMAND:
+        switch (LOWORD(wParam)) {
+        case ID_STARTUP_SCAN: StartStartupScan(window); return 0;
+        case ID_STARTUP_SELECT_RISK: {
+            HWND list = GetDlgItem(window, ID_STARTUP_LIST);
+            for (int index = 0; index < ListView_GetItemCount(list) && index < static_cast<int>(g_startupItems.size()); ++index) {
+                const StartupItem& item = g_startupItems[static_cast<size_t>(index)];
+                ListView_SetCheckState(list, index, (!item.protectedItem && item.enabled && (item.chainRisk || item.highRisk || item.thirdParty)) ? TRUE : FALSE);
+            }
+            return 0;
+        }
+        case ID_STARTUP_BLOCK: ApplySelectedStartupItems(window, true); return 0;
+        case ID_STARTUP_RESTORE: ApplySelectedStartupItems(window, false); return 0;
+        case ID_STARTUP_CANCEL: DestroyWindow(window); return 0;
+        }
+        break;
+    case WM_CLOSE: DestroyWindow(window); return 0;
+    case WM_DESTROY: if (g_startupWindow == window) g_startupWindow = nullptr; return 0;
+    case WM_NCDESTROY: ReleaseUiFont(window); return DefWindowProcW(window, message, wParam, lParam);
+    }
+    return DefWindowProcW(window, message, wParam, lParam);
+}
+
+void ShowStartupWindow(HWND owner) {
+    if (g_startupWindow) { SetForegroundWindow(g_startupWindow); return; }
+    POINT cursor{}; GetCursorPos(&cursor);
+    HMONITOR monitor = MonitorFromPoint(cursor, MONITOR_DEFAULTTONEAREST);
+    MONITORINFO info{sizeof(info)}; GetMonitorInfoW(monitor, &info);
+    const UINT dpi = GetMonitorDpiSafe(monitor, owner);
+    const int edge = ScaleUi(24, dpi);
+    const int width = (std::min)(ScaleUi(1180, dpi), static_cast<int>(info.rcWork.right - info.rcWork.left - edge * 2));
+    const int height = (std::min)(ScaleUi(780, dpi), static_cast<int>(info.rcWork.bottom - info.rcWork.top - edge * 2));
+    const int x = info.rcWork.left + (info.rcWork.right - info.rcWork.left - width) / 2;
+    const int y = info.rcWork.top + (info.rcWork.bottom - info.rcWork.top - height) / 2;
+    g_startupWindow = CreateWindowExW(WS_EX_TOOLWINDOW, kStartupClass,
+                                      T(L"Liberty startup manager", L"Liberty 启动项管理"),
+                                      WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
+                                      x, y, width, height, owner, nullptr, g_instance, nullptr);
+    if (g_startupWindow) { ShowWindow(g_startupWindow, SW_SHOW); UpdateWindow(g_startupWindow); }
+}
+
 void ShowAboutWindow(HWND owner) {
     if (g_aboutWindow) { SetForegroundWindow(g_aboutWindow); return; }
     POINT cursor{}; GetCursorPos(&cursor);
@@ -1756,7 +2748,7 @@ LRESULT CALLBACK AboutProc(HWND window, UINT message, WPARAM wParam, LPARAM lPar
         DrawTextW(hdc, L"Liberty", -1, &title, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
         SelectObject(hdc, old); DeleteObject(font);
         RECT text{ScaleUi(28, dpi), ScaleUi(156, dpi), ScaleUi(480, dpi), ScaleUi(278, dpi)};
-        std::wstring about = L"Liberty 1.1.3\n\n";
+        std::wstring about = L"Liberty 1.2.0\n\n";
         about += T(L"Trinity mark: freedom, control, and focus.", L"Trinity 标志：自由、控制与专注。\n");
         about += L"\nCmd = "; about += ModifierLabel(g_commandKey);
         about += L"\nOption = "; about += ModifierLabel(g_optionKey);
@@ -1787,7 +2779,7 @@ std::vector<MenuRow> BuildMenuRows() {
     std::vector<MenuRow> rows; rows.push_back({MenuRow::Status, 0, L"Liberty", g_enabled ? T(L"Shortcuts enabled", L"快捷键已启用") : T(L"Shortcuts paused", L"快捷键已暂停"), false, true});
     AddMenuAction(rows, ID_TOGGLE, g_enabled ? L"Pause shortcuts" : L"Resume shortcuts", g_enabled ? L"暂停快捷键" : L"恢复快捷键", g_enabled);
     AddMenuHeader(rows, L"Display & power", L"显示与电源"); AddMenuAction(rows, ID_SCREEN_OFF, L"Turn display off", L"关闭显示器"); AddMenuAction(rows, ID_SCREENSHOT_DESKTOP, L"Save screenshot to Desktop", L"截图并保存到桌面"); AddMenuAction(rows, ID_SHUTDOWN_15, L"Shut down in 15 minutes", L"15 分钟后关机"); AddMenuAction(rows, ID_SHUTDOWN_30, L"Shut down in 30 minutes", L"30 分钟后关机"); AddMenuAction(rows, ID_SHUTDOWN_60, L"Shut down in 1 hour", L"1 小时后关机"); AddMenuAction(rows, ID_SHUTDOWN_120, L"Shut down in 2 hours", L"2 小时后关机"); AddMenuAction(rows, ID_SHUTDOWN_CUSTOM, L"Custom shutdown time…", L"自定义关机时间…"); AddMenuAction(rows, ID_SHUTDOWN_CANCEL, L"Cancel scheduled shutdown", L"取消定时关机");
-    AddMenuHeader(rows, L"Keyboard & startup", L"键盘与启动"); AddMenuAction(rows, ID_STARTUP, L"Start with Windows", L"随 Windows 启动", g_startAtLogin); AddMenuAction(rows, ID_MAPPINGS, L"Keyboard mappings…", L"快捷键映射…"); AddMenuAction(rows, ID_MENU_LANGUAGE, g_language == AppLanguage::Chinese ? L"Switch to English" : L"切换到简体中文", g_language == AppLanguage::Chinese ? L"切换到 English" : L"切换到简体中文");
+    AddMenuHeader(rows, L"Keyboard & startup", L"键盘与启动"); AddMenuAction(rows, ID_STARTUP, L"Start with Windows", L"随 Windows 启动", g_startAtLogin); AddMenuAction(rows, ID_MAPPINGS, L"Keyboard mappings…", L"快捷键映射…"); AddMenuAction(rows, ID_STARTUP_MANAGER, L"Manage startup items…", L"管理开机启动项…"); AddMenuAction(rows, ID_MENU_LANGUAGE, g_language == AppLanguage::Chinese ? L"Switch to English" : L"切换到简体中文", g_language == AppLanguage::Chinese ? L"切换到 English" : L"切换到简体中文");
     AddMenuHeader(rows, L"Windows integration", L"Windows 集成"); AddMenuAction(rows, ID_BLOCK_ONEDRIVE, L"Block OneDrive auto-start", L"阻止 OneDrive 自动启动", g_blockOneDrive); AddMenuAction(rows, ID_HIDE_NVIDIA, L"Hide NVIDIA panel startup", L"隐藏 NVIDIA 面板启动", g_hideNvidiaPanel); AddMenuAction(rows, ID_HIDE_AMD, L"Hide AMD panel startup", L"隐藏 AMD 面板启动", g_hideAmdPanel); AddMenuAction(rows, ID_HIDE_SECURITY, L"Hide Windows Security tray entry", L"隐藏 Windows Security 托盘入口", g_hideSecurityCenter);
     AddMenuHeader(rows, L"Tools", L"工具"); AddMenuAction(rows, ID_OVERLAY_OPEN, L"Pin an image on desktop", L"将图片悬浮在桌面"); AddMenuAction(rows, ID_OVERLAY_RESTORE, L"Restore last image", L"恢复上次图片", false, !g_overlay.path.empty()); AddMenuAction(rows, ID_OVERLAY_LOCK, g_overlay.locked ? L"Unlock image position" : L"Lock image position", g_overlay.locked ? L"解锁图片位置" : L"锁定图片位置", g_overlay.locked, g_overlayWindow != nullptr); AddMenuAction(rows, ID_OVERLAY_CLICKTHROUGH, g_overlay.clickThrough ? L"Disable mouse passthrough" : L"Enable mouse passthrough", g_overlay.clickThrough ? L"关闭鼠标穿透" : L"开启鼠标穿透", g_overlay.clickThrough, g_overlayWindow != nullptr); AddMenuAction(rows, ID_OVERLAY_CLOSE, L"Close floating image", L"关闭悬浮图片", false, g_overlayWindow != nullptr); AddMenuAction(rows, ID_CLEANUP, L"Scan and clean caches…", L"扫描并清理缓存…"); AddMenuAction(rows, ID_ABOUT, L"About Liberty", L"关于 Liberty"); AddMenuAction(rows, ID_EXIT, L"Exit Liberty", L"退出 Liberty");
     return rows;
@@ -1828,6 +2820,7 @@ void ExecuteCommand(UINT command) {
     case ID_SHUTDOWN_CANCEL: CancelShutdown(); break;
     case ID_STARTUP: if (!SetStartup(!g_startAtLogin)) MessageBoxW(g_window, T(L"Could not update startup.", L"无法更新启动设置。"), kAppName, MB_OK | MB_ICONERROR); break;
     case ID_MAPPINGS: ShowMappingDialog(g_window); break;
+    case ID_STARTUP_MANAGER: ShowStartupWindow(g_window); break;
     case ID_MENU_LANGUAGE: ToggleLanguage(); break;
     case ID_BLOCK_ONEDRIVE: { const bool next = !g_blockOneDrive; if (next && OneDrivePolicyForcesAutoStart()) { MessageBoxW(g_window, T(L"OneDrive auto-start is controlled by a Windows policy.", L"OneDrive 自动启动由 Windows 策略控制。"), kAppName, MB_OK | MB_ICONWARNING); break; } if (ApplyOneDriveBlock(next, next)) { g_blockOneDrive = next; SaveDword(L"BlockOneDrive", next ? 1 : 0); } else MessageBoxW(g_window, T(L"Liberty could not update all OneDrive startup entries.", L"Liberty 无法更新全部 OneDrive 启动入口。"), kAppName, MB_OK | MB_ICONERROR); break; }
     case ID_HIDE_NVIDIA: if (ApplyRunEntryBlocks(kNvidiaEntries, ARRAYSIZE(kNvidiaEntries), !g_hideNvidiaPanel)) { g_hideNvidiaPanel = !g_hideNvidiaPanel; SaveDword(L"HideNvidiaPanel", g_hideNvidiaPanel ? 1 : 0); } else MessageBoxW(g_window, T(L"Could not update NVIDIA startup entries.", L"无法更新 NVIDIA 启动入口。"), kAppName, MB_OK | MB_ICONERROR); break;
@@ -2096,17 +3089,25 @@ bool RegisterClasses() {
         case WM_HOTKEY: if (wParam == 1) { g_enabled = !g_enabled; SaveDword(L"Enabled", g_enabled ? 1 : 0); ResetMappedModifierState(); RefreshTrayIcon(); } if (wParam == 2) ScreenOff(); if (wParam == 3) ScheduleShutdown(60 * 60); if (wParam == 4) CancelShutdown(); return 0;
         case kTrayMessage: { const UINT trayEvent = LOWORD(lParam); if (trayEvent == WM_LBUTTONUP) { g_enabled = !g_enabled; SaveDword(L"Enabled", g_enabled ? 1 : 0); ResetMappedModifierState(); RefreshTrayIcon(); } else if (trayEvent == WM_RBUTTONUP || trayEvent == WM_CONTEXTMENU) HandleTrayMenuEvent(window, trayEvent); return 0; }
         case WM_SETTINGCHANGE: if (g_menuWindow) InvalidateRect(g_menuWindow, nullptr, TRUE); return 0;
-        case WM_DESTROY: KillTimer(window, kOneDriveRefreshTimer); ResetMappedModifierState(); UnregisterHotKey(window, 1); UnregisterHotKey(window, 2); UnregisterHotKey(window, 3); UnregisterHotKey(window, 4); if (g_hook) { UnhookWindowsHookEx(g_hook); g_hook = nullptr; } CloseOverlay(); if (g_cleanupWindow) DestroyWindow(g_cleanupWindow); if (g_aboutWindow) DestroyWindow(g_aboutWindow); Shell_NotifyIconW(NIM_DELETE, &g_tray); if (g_tray.hIcon) { DestroyIcon(g_tray.hIcon); g_tray.hIcon = nullptr; } PostQuitMessage(0); return 0;
+        case WM_DESTROY: KillTimer(window, kOneDriveRefreshTimer); ResetMappedModifierState(); UnregisterHotKey(window, 1); UnregisterHotKey(window, 2); UnregisterHotKey(window, 3); UnregisterHotKey(window, 4); if (g_hook) { UnhookWindowsHookEx(g_hook); g_hook = nullptr; } CloseOverlay(); if (g_cleanupWindow) DestroyWindow(g_cleanupWindow); if (g_startupWindow) DestroyWindow(g_startupWindow); if (g_aboutWindow) DestroyWindow(g_aboutWindow); Shell_NotifyIconW(NIM_DELETE, &g_tray); if (g_tray.hIcon) { DestroyIcon(g_tray.hIcon); g_tray.hIcon = nullptr; } PostQuitMessage(0); return 0;
         }
         return DefWindowProcW(window, message, wParam, lParam);
     };
     tray.hInstance = g_instance; tray.hCursor = LoadCursorW(nullptr, IDC_ARROW); tray.hIcon = CreateTrinityIcon(true); tray.hIconSm = tray.hIcon; tray.lpszClassName = kWindowClass; if (!RegisterClassExW(&tray)) return false;
     auto registerSimple = [](const wchar_t* name, WNDPROC proc) { WNDCLASSEXW cls{sizeof(cls)}; cls.lpfnWndProc = proc; cls.hInstance = g_instance; cls.hCursor = LoadCursorW(nullptr, IDC_ARROW); cls.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1); cls.lpszClassName = name; return RegisterClassExW(&cls) != 0; };
-    return registerSimple(kMenuClass, MenuProc) && registerSimple(kOverlayClass, OverlayProc) && registerSimple(kCleanupClass, CleanupProc) && registerSimple(kAboutClass, AboutProc);
+    return registerSimple(kMenuClass, MenuProc) && registerSimple(kOverlayClass, OverlayProc) && registerSimple(kCleanupClass, CleanupProc) && registerSimple(kStartupClass, StartupProc) && registerSimple(kAboutClass, AboutProc);
 }
 
 void RunCleanupHelper(const std::wstring& path) {
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED); const std::vector<std::wstring> keys = ReadCleanupPlan(path); size_t successCount = 0; const bool success = !keys.empty() && RunCleanupKeys(keys, successCount); CoUninitialize(); ExitProcess(success ? 0 : 1);
+}
+
+void RunStartupHelper(const std::wstring& path) {
+    CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    std::wstring message;
+    const bool success = RunStartupPlan(path, message);
+    CoUninitialize();
+    ExitProcess(success ? 0 : 1);
 }
 
 } // namespace
@@ -2119,6 +3120,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
         for (int index = 1; index < argumentCount; ++index) {
             if (_wcsicmp(arguments[index], L"--apply-security-systray") == 0 && index + 1 < argumentCount) { const bool hidden = _wcsicmp(arguments[index + 1], L"1") == 0; LocalFree(arguments); CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED); const bool result = SetSecurityCenterHiddenDirect(hidden); CoUninitialize(); return result ? 0 : 1; }
             if (_wcsicmp(arguments[index], L"--cleanup") == 0 && index + 1 < argumentCount) { const std::wstring path = arguments[index + 1]; LocalFree(arguments); RunCleanupHelper(path); return 1; }
+            if (_wcsicmp(arguments[index], L"--startup-apply") == 0 && index + 1 < argumentCount) { const std::wstring path = arguments[index + 1]; LocalFree(arguments); RunStartupHelper(path); return 1; }
         }
         LocalFree(arguments);
     }

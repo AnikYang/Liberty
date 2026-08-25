@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(Liberty VERSION 1.1.3 LANGUAGES CXX)
+project(Liberty VERSION 1.2.0 LANGUAGES CXX)
 
 add_executable(Liberty WIN32 src/main.cpp app.rc)
 target_compile_features(Liberty PRIVATE cxx_std_17)

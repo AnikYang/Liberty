@@ -72,6 +72,7 @@ constexpr UINT kCleanupRunComplete = WM_APP + 4;
 constexpr UINT kStartupScanComplete = WM_APP + 6;
 constexpr UINT kStartupApplyComplete = WM_APP + 7;
 constexpr UINT kMenuRebuild = WM_APP + 8;
+constexpr UINT kShowMainMenuMessage = WM_APP + 9;
 constexpr UINT_PTR kMenuAnimationTimer = 9;
 constexpr UINT_PTR kOneDriveRefreshTimer = 5;
 constexpr ULONG_PTR kInjectedMarker = 0x4C494245525459ULL;
@@ -3564,6 +3565,7 @@ bool RegisterClasses() {
     tray.lpfnWndProc = [](HWND window, UINT message, WPARAM wParam, LPARAM lParam) -> LRESULT {
         if (g_taskbarCreated && message == g_taskbarCreated) { Shell_NotifyIconW(NIM_ADD, &g_tray); g_tray.uVersion = NOTIFYICON_VERSION_4; Shell_NotifyIconW(NIM_SETVERSION, &g_tray); return 0; }
         switch (message) {
+        case kShowMainMenuMessage: if (!g_menuWindow) ShowModernMenu(window); return 0;
         case WM_TIMER: if (wParam == kOneDriveRefreshTimer && g_blockOneDrive) ApplyOneDriveBlock(true, false); return 0;
         case WM_HOTKEY: if (wParam == 1) { g_enabled = !g_enabled; SaveDword(L"Enabled", g_enabled ? 1 : 0); ResetMappedModifierState(); RefreshTrayIcon(); } if (wParam == 2) ScreenOff(); if (wParam == 3) ScheduleShutdown(60 * 60); if (wParam == 4) CancelShutdown(); return 0;
         case kTrayMessage: { const UINT trayEvent = LOWORD(lParam); if (trayEvent == WM_LBUTTONUP) { g_enabled = !g_enabled; SaveDword(L"Enabled", g_enabled ? 1 : 0); ResetMappedModifierState(); RefreshTrayIcon(); } else if (trayEvent == WM_RBUTTONUP || trayEvent == WM_CONTEXTMENU) HandleTrayMenuEvent(window, trayEvent); return 0; }
@@ -3619,7 +3621,14 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
         }
         LocalFree(arguments);
     }
-    g_mutex = CreateMutexW(nullptr, TRUE, L"Local\\Liberty.SingleInstance"); if (!g_mutex || GetLastError() == ERROR_ALREADY_EXISTS) return 0;
+    g_mutex = CreateMutexW(nullptr, TRUE, L"Local\\Liberty.SingleInstance");
+    if (!g_mutex) return 1;
+    if (GetLastError() == ERROR_ALREADY_EXISTS) {
+        if (HWND existing = FindWindowW(kWindowClass, nullptr)) PostMessageW(existing, kShowMainMenuMessage, 0, 0);
+        CloseHandle(g_mutex);
+        g_mutex = nullptr;
+        return 0;
+    }
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED); Gdiplus::GdiplusStartupInput gdiplusInput; Gdiplus::GdiplusStartup(&g_gdiplusToken, &gdiplusInput, nullptr); INITCOMMONCONTROLSEX controls{sizeof(controls), ICC_LISTVIEW_CLASSES | ICC_STANDARD_CLASSES}; InitCommonControlsEx(&controls); InitializeLanguage();
     g_enabled = LoadDword(L"Enabled", 1) != 0; g_startAtLogin = IsStartupEnabled(); g_blockOneDrive = LoadDword(L"BlockOneDrive", 0) != 0; g_hideNvidiaPanel = LoadDword(L"HideNvidiaPanel", 0) != 0; g_hideAmdPanel = LoadDword(L"HideAmdPanel", 0) != 0; g_hideSecurityCenter = IsSecurityCenterHidden(); g_autoSaveScreenshots = LoadDword(L"AutoSaveScreenshots", 0) != 0; LoadModifierMappings(); g_taskbarCreated = RegisterWindowMessageW(L"TaskbarCreated"); if (!RegisterClasses()) return 1;
     g_window = CreateWindowExW(WS_EX_TOOLWINDOW, kWindowClass, kAppName, WS_OVERLAPPED, 0, 0, 0, 0, nullptr, nullptr, instance, nullptr); if (!g_window) return 1;

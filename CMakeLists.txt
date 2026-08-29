@@ -12,8 +12,10 @@ target_link_libraries(Liberty PRIVATE
 if(MSVC)
   # Static C/C++ runtime: the release remains one portable EXE.
   set_property(TARGET Liberty PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
-  target_compile_options(Liberty PRIVATE /W4 /permissive- /O1 /Os /GL /utf-8)
-  target_link_options(Liberty PRIVATE /MANIFEST:NO /LTCG /OPT:REF /OPT:ICF /SUBSYSTEM:WINDOWS)
+  target_compile_options(Liberty PRIVATE /W4 /permissive- /utf-8)
+  target_compile_options(Liberty PRIVATE $<$<CONFIG:Release>:/O2> $<$<CONFIG:Release>:/Ob2>)
+  target_link_options(Liberty PRIVATE /MANIFEST:NO /SUBSYSTEM:WINDOWS)
+  target_link_options(Liberty PRIVATE $<$<CONFIG:Release>:/OPT:REF> $<$<CONFIG:Release>:/OPT:ICF>)
 else()
   target_compile_options(Liberty PRIVATE -Wall -Wextra -Os -ffunction-sections -fdata-sections)
   target_link_options(Liberty PRIVATE -static -s -Wl,--gc-sections -mwindows)

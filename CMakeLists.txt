@@ -5,8 +5,8 @@ add_executable(Liberty WIN32 src/main.cpp app.rc)
 target_compile_features(Liberty PRIVATE cxx_std_17)
 target_compile_definitions(Liberty PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN _WIN32_WINNT=0x0A00)
 target_link_libraries(Liberty PRIVATE
-  user32 shell32 advapi32 gdi32 comctl32 comdlg32 shlwapi msimg32
-  dwmapi gdiplus windowscodecs ole32 oleaut32 taskschd shcore uxtheme
+  user32 shell32 advapi32 gdi32 comctl32 comdlg32
+  dwmapi gdiplus ole32 oleaut32 uxtheme powrprof
 )
 
 if(MSVC)

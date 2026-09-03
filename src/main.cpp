@@ -17,7 +17,6 @@
 #include <gdiplus.h>
 #include <objbase.h>
 #include <uxtheme.h>
-#include <powrprof.h>
 
 #include <algorithm>
 #include <cmath>
@@ -45,7 +44,6 @@ constexpr wchar_t kRunKey[] = L"Software\\Microsoft\\Windows\\CurrentVersion\\Ru
 
 constexpr UINT kTrayMessage = WM_APP + 1;
 constexpr UINT kShowMenuMessage = WM_APP + 2;
-constexpr UINT_PTR kSleepTimer = 11;
 constexpr ULONG_PTR kInjectedMarker = 0x4C494245525459ULL;
 
 enum Command : UINT {
@@ -57,6 +55,11 @@ enum Command : UINT {
     ID_SETTINGS,
     ID_ABOUT,
     ID_LANGUAGE,
+    ID_STARTUP,
+    ID_COMMAND_COMBO,
+    ID_ALT_COMBO,
+    ID_CONTROL_COMBO,
+    ID_SETTINGS_SAVE,
     ID_SETTINGS_CLOSE
 };
 
@@ -67,13 +70,29 @@ struct MenuItem {
     const wchar_t* chinese;
 };
 
+struct ModifierChoice {
+    WORD virtualKey;
+    const wchar_t* english;
+    const wchar_t* chinese;
+};
+
 constexpr MenuItem kMenuItems[] = {
-    {ID_MAC_MAPPING, true,  L"Map shortcuts to macOS", L"将快捷键映射至 macOS"},
-    {ID_SLEEP_WITH_DISPLAY, true, L"Sleep computer when display turns off", L"关闭显示器时让电脑休眠"},
+    {ID_MAC_MAPPING, true,  L"Use macOS shortcuts", L"使用MacOS快捷键"},
+    {ID_SLEEP_WITH_DISPLAY, true, L"Turn display off and prevent computer sleep", L"关闭显示器并防止电脑休眠"},
     {ID_PREVENT_SLEEP, true, L"Prevent computer sleep", L"防止电脑休眠"},
     {ID_CLEAR_CACHE, false, L"Clear cache", L"清理缓存"},
     {ID_SAVE_SCREENSHOTS, true, L"Save screenshots to Desktop instead of clipboard", L"将截图保存至桌面而不是剪贴板"},
     {ID_SETTINGS, false, L"Settings", L"设置"}
+};
+
+constexpr ModifierChoice kModifierChoices[] = {
+    {VK_LWIN, L"Left Windows", L"左 Windows"},
+    {VK_RWIN, L"Right Windows", L"右 Windows"},
+    {VK_LMENU, L"Left Alt", L"左 Alt"},
+    {VK_RMENU, L"Right Alt", L"右 Alt"},
+    {VK_LCONTROL, L"Left Control", L"左 Control"},
+    {VK_RCONTROL, L"Right Control", L"右 Control"},
+    {VK_CAPITAL, L"Caps Lock", L"Caps Lock"}
 };
 
 HINSTANCE g_instance = nullptr;
@@ -90,10 +109,16 @@ HFONT g_settingsFont = nullptr;
 
 bool g_chinese = true;
 bool g_macMapping = false;
-bool g_sleepWithDisplay = false;
+bool g_displayOffAwake = false;
 bool g_preventSleep = false;
 bool g_saveScreenshots = false;
 bool g_commandDown = false;
+bool g_optionDown = false;
+bool g_controlDown = false;
+bool g_startAtLogin = true;
+WORD g_commandKey = VK_LWIN;
+WORD g_altKey = VK_LMENU;
+WORD g_controlKey = VK_LCONTROL;
 int g_menuHover = -1;
 DWORD g_lastClipboardSequence = 0;
 #ifdef _DEBUG
@@ -138,6 +163,72 @@ void SaveDword(const wchar_t* name, DWORD value) {
                         nullptr, &key, nullptr) != ERROR_SUCCESS) return;
     RegSetValueExW(key, name, 0, REG_DWORD, reinterpret_cast<const BYTE*>(&value), sizeof(value));
     RegCloseKey(key);
+}
+
+std::wstring ModulePath() {
+    std::vector<wchar_t> buffer(MAX_PATH);
+    for (;;) {
+        const DWORD length = GetModuleFileNameW(nullptr, buffer.data(), static_cast<DWORD>(buffer.size()));
+        if (!length) return {};
+        if (length < buffer.size() - 1) return std::wstring(buffer.data(), length);
+        buffer.resize(buffer.size() * 2);
+    }
+}
+
+bool DeleteRunValue(const wchar_t* name) {
+    HKEY key = nullptr;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, kRunKey, 0, KEY_SET_VALUE, &key) != ERROR_SUCCESS) return true;
+    const LONG result = RegDeleteValueW(key, name);
+    RegCloseKey(key);
+    return result == ERROR_SUCCESS || result == ERROR_FILE_NOT_FOUND;
+}
+
+bool SetStartAtLogin(bool enabled) {
+    bool success = true;
+    if (enabled) {
+        const std::wstring path = ModulePath();
+        if (path.empty()) return false;
+        HKEY key = nullptr;
+        if (RegCreateKeyExW(HKEY_CURRENT_USER, kRunKey, 0, nullptr, 0, KEY_SET_VALUE,
+                            nullptr, &key, nullptr) != ERROR_SUCCESS) return false;
+        const std::wstring command = L"\"" + path + L"\"";
+        success = RegSetValueExW(key, kAppName, 0, REG_SZ,
+                                 reinterpret_cast<const BYTE*>(command.c_str()),
+                                 static_cast<DWORD>((command.size() + 1) * sizeof(wchar_t))) == ERROR_SUCCESS;
+        RegCloseKey(key);
+        DeleteRunValue(kLegacyAppName);
+    } else {
+        success = DeleteRunValue(kAppName) && DeleteRunValue(kLegacyAppName);
+    }
+    if (success) {
+        g_startAtLogin = enabled;
+        SaveDword(L"StartAtLogin", enabled ? 1 : 0);
+    }
+    return success;
+}
+
+int ModifierChoiceIndex(WORD key) {
+    for (size_t index = 0; index < ARRAYSIZE(kModifierChoices); ++index)
+        if (kModifierChoices[index].virtualKey == key) return static_cast<int>(index);
+    return 0;
+}
+
+bool IsModifierChoice(WORD key) {
+    for (const ModifierChoice& choice : kModifierChoices)
+        if (choice.virtualKey == key) return true;
+    return false;
+}
+
+void LoadModifierMappings() {
+    const WORD command = static_cast<WORD>(LoadDword(L"CommandKey", VK_LWIN));
+    const WORD alt = static_cast<WORD>(LoadDword(L"AltKey", VK_LMENU));
+    const WORD control = static_cast<WORD>(LoadDword(L"ControlKey", VK_LCONTROL));
+    if (IsModifierChoice(command) && IsModifierChoice(alt) && IsModifierChoice(control) &&
+        command != alt && command != control && alt != control) {
+        g_commandKey = command;
+        g_altKey = alt;
+        g_controlKey = control;
+    }
 }
 
 void InitializeLanguage() {
@@ -218,12 +309,13 @@ void Notify(const std::wstring& text) {
 }
 
 void ApplyPreventSleep() {
-    SetThreadExecutionState(g_preventSleep ? ES_CONTINUOUS | ES_SYSTEM_REQUIRED : ES_CONTINUOUS);
+    const bool keepAwake = g_preventSleep || g_displayOffAwake;
+    SetThreadExecutionState(keepAwake ? ES_CONTINUOUS | ES_SYSTEM_REQUIRED : ES_CONTINUOUS);
 }
 
 void TurnOffDisplay() {
+    if (g_displayOffAwake) ApplyPreventSleep();
     PostMessageW(HWND_BROADCAST, WM_SYSCOMMAND, SC_MONITORPOWER, 2);
-    if (g_sleepWithDisplay && g_window) SetTimer(g_window, kSleepTimer, 600, nullptr);
 }
 
 void SendKey(WORD virtualKey, bool down) {
@@ -241,6 +333,23 @@ void SendControlCombo(WORD virtualKey, bool down) {
     SendKey(VK_CONTROL, false);
 }
 
+void SendAltCombo(WORD virtualKey, bool down) {
+    SendKey(VK_MENU, true);
+    SendKey(virtualKey, down);
+    SendKey(VK_MENU, false);
+}
+
+bool IsPhysicalControl(WORD key) { return key == VK_LCONTROL || key == VK_RCONTROL; }
+bool IsKeyDown(int key) { return (GetAsyncKeyState(key) & 0x8000) != 0; }
+
+void ReleaseMappedState() {
+    if (g_optionDown) SendKey(VK_MENU, false);
+    if (g_controlDown && !IsPhysicalControl(g_controlKey)) SendKey(VK_CONTROL, false);
+    g_commandDown = false;
+    g_optionDown = false;
+    g_controlDown = false;
+}
+
 void MinimizeForeground() {
     const HWND foreground = GetForegroundWindow();
     if (foreground) ShowWindow(foreground, SW_MINIMIZE);
@@ -254,17 +363,38 @@ LRESULT CALLBACK KeyboardProc(int code, WPARAM message, LPARAM data) {
     const bool up = message == WM_KEYUP || message == WM_SYSKEYUP;
     if (!down && !up) return CallNextHookEx(g_keyboardHook, code, message, data);
     const DWORD key = event->vkCode;
-    if (key == VK_LWIN) {
+    if (key == g_commandKey) {
         g_commandDown = down;
         return 1;
     }
-    if (!g_commandDown) return CallNextHookEx(g_keyboardHook, code, message, data);
+    if (key == g_altKey) {
+        g_optionDown = down;
+        SendKey(VK_MENU, down);
+        return 1;
+    }
+    if (key == g_controlKey) {
+        g_controlDown = down;
+        if (IsPhysicalControl(g_controlKey)) return CallNextHookEx(g_keyboardHook, code, message, data);
+        SendKey(VK_CONTROL, down);
+        return 1;
+    }
+    if (!g_commandDown) {
+        if (g_optionDown && (key == VK_LEFT || key == VK_RIGHT || key == VK_BACK)) {
+            SendKey(VK_MENU, false);
+            SendControlCombo(static_cast<WORD>(key), down);
+            SendKey(VK_MENU, true);
+            return 1;
+        }
+        return CallNextHookEx(g_keyboardHook, code, message, data);
+    }
     if (key == VK_TAB) {
-        SendKey(VK_MENU, true); SendKey(VK_TAB, down); if (up) SendKey(VK_MENU, false);
+        if (down) SendKey(VK_MENU, true);
+        SendKey(VK_TAB, down);
+        if (up) SendKey(VK_MENU, false);
         return 1;
     }
     if (key == 'Q') {
-        SendKey(VK_MENU, true); SendKey(VK_F4, down); if (up) SendKey(VK_MENU, false);
+        SendAltCombo(VK_F4, down);
         return 1;
     }
     if (key == 'H' || key == 'M') {
@@ -273,6 +403,24 @@ LRESULT CALLBACK KeyboardProc(int code, WPARAM message, LPARAM data) {
     }
     if (key == VK_LEFT || key == VK_RIGHT) {
         SendKey(key == VK_LEFT ? VK_HOME : VK_END, down);
+        return 1;
+    }
+    if (key == VK_UP || key == VK_DOWN) {
+        SendControlCombo(key == VK_UP ? VK_HOME : VK_END, down);
+        return 1;
+    }
+    if (key == VK_SPACE) {
+        if (down) {
+            SendKey(VK_LWIN, true); SendKey('S', true); SendKey('S', false); SendKey(VK_LWIN, false);
+        }
+        return 1;
+    }
+    if ((key == '3' || key == '4') && IsKeyDown(VK_SHIFT)) {
+        if (down && key == '3') { SendKey(VK_SNAPSHOT, true); SendKey(VK_SNAPSHOT, false); }
+        if (down && key == '4') {
+            SendKey(VK_LWIN, true); SendKey(VK_SHIFT, true); SendKey('S', true); SendKey('S', false);
+            SendKey(VK_SHIFT, false); SendKey(VK_LWIN, false);
+        }
         return 1;
     }
     SendControlCombo(static_cast<WORD>(key), down);
@@ -289,9 +437,9 @@ bool SetMacMapping(bool enabled) {
         }
     }
     if (!enabled && g_keyboardHook) {
+        ReleaseMappedState();
         UnhookWindowsHookEx(g_keyboardHook);
         g_keyboardHook = nullptr;
-        g_commandDown = false;
     }
     g_macMapping = enabled;
     SaveDword(L"MacMapping", enabled ? 1 : 0);
@@ -408,7 +556,7 @@ void ShowAbout() {
 void UpdateMenuToggles() {
     if (!g_menuWindow) return;
     Button_SetCheck(GetDlgItem(g_menuWindow, ID_MAC_MAPPING), g_macMapping ? BST_CHECKED : BST_UNCHECKED);
-    Button_SetCheck(GetDlgItem(g_menuWindow, ID_SLEEP_WITH_DISPLAY), g_sleepWithDisplay ? BST_CHECKED : BST_UNCHECKED);
+    Button_SetCheck(GetDlgItem(g_menuWindow, ID_SLEEP_WITH_DISPLAY), g_displayOffAwake ? BST_CHECKED : BST_UNCHECKED);
     Button_SetCheck(GetDlgItem(g_menuWindow, ID_PREVENT_SLEEP), g_preventSleep ? BST_CHECKED : BST_UNCHECKED);
     Button_SetCheck(GetDlgItem(g_menuWindow, ID_SAVE_SCREENSHOTS), g_saveScreenshots ? BST_CHECKED : BST_UNCHECKED);
 }
@@ -424,8 +572,10 @@ void ApplyToggle(UINT id) {
         SetMacMapping(!g_macMapping);
         break;
     case ID_SLEEP_WITH_DISPLAY:
-        g_sleepWithDisplay = !g_sleepWithDisplay;
-        SaveDword(L"SleepWithDisplay", g_sleepWithDisplay ? 1 : 0);
+        g_displayOffAwake = !g_displayOffAwake;
+        SaveDword(L"DisplayOffAwake", g_displayOffAwake ? 1 : 0);
+        ApplyPreventSleep();
+        if (g_displayOffAwake) TurnOffDisplay();
         break;
     case ID_PREVENT_SLEEP:
         g_preventSleep = !g_preventSleep;
@@ -454,10 +604,17 @@ void ExecuteMenuAction(UINT id) {
         if (!g_settingsWindow) {
             RECT work{};
             SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0);
-            g_settingsWindow = CreateWindowExW(WS_EX_TOOLWINDOW, kSettingsClass, T(L"Settings", L"设置"),
+#ifdef _DEBUG
+            const DWORD settingsExtendedStyle = g_previewMenu ? WS_EX_APPWINDOW : WS_EX_TOOLWINDOW;
+            HWND settingsOwner = g_previewMenu ? nullptr : g_window;
+#else
+            const DWORD settingsExtendedStyle = WS_EX_TOOLWINDOW;
+            HWND settingsOwner = g_window;
+#endif
+            g_settingsWindow = CreateWindowExW(settingsExtendedStyle, kSettingsClass, T(L"Settings", L"设置"),
                                                 WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
-                                                work.left + 80, work.top + 80, Scale(360), Scale(210),
-                                                g_window, nullptr, g_instance, nullptr);
+                                                work.left + 80, work.top + 80, Scale(460), Scale(390),
+                                                settingsOwner, nullptr, g_instance, nullptr);
             if (g_settingsWindow) ShowWindow(g_settingsWindow, SW_SHOW);
         } else SetForegroundWindow(g_settingsWindow);
     } else if (id == ID_ABOUT) {
@@ -502,10 +659,10 @@ void BuildMenuControls(HWND window) {
         const MenuItem& item = kMenuItems[index];
         if (!item.toggle) continue;
         RECT row = MenuRowRect(window, static_cast<int>(index));
-        HWND checkbox = CreateWindowExW(0, L"BUTTON", L"",
-                                        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
-                                        row.right - MulDiv(38, dpi, 96), row.top + MulDiv(10, dpi, 96),
-                                        MulDiv(28, dpi, 96), MulDiv(30, dpi, 96),
+        HWND checkbox = CreateWindowExW(0, L"BUTTON", T(item.english, item.chinese),
+                                        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX | BS_RIGHTBUTTON,
+                                        row.left + MulDiv(12, dpi, 96), row.top + MulDiv(3, dpi, 96),
+                                        row.right - row.left - MulDiv(24, dpi, 96), row.bottom - row.top - MulDiv(6, dpi, 96),
                                         window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(item.id)),
                                         g_instance, nullptr);
         if (checkbox) {
@@ -543,14 +700,14 @@ LRESULT CALLBACK MenuProc(HWND window, UINT message, WPARAM wParam, LPARAM lPara
         for (size_t index = 0; index < ARRAYSIZE(kMenuItems); ++index) {
             const MenuItem& item = kMenuItems[index];
             RECT row = MenuRowRect(window, static_cast<int>(index));
-            if (g_menuHover == static_cast<int>(index)) {
+            if (!item.toggle && g_menuHover == static_cast<int>(index)) {
                 HBRUSH hover = CreateSolidBrush(RGB(239, 244, 255));
                 FillRect(buffer, &row, hover);
                 DeleteObject(hover);
             }
-            RECT text{row.left + Scale(14, window), row.top, row.right - Scale(item.toggle ? 54 : 42, window), row.bottom};
-            DrawTextW(buffer, T(item.english, item.chinese), -1, &text, DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
             if (!item.toggle) {
+                RECT text{row.left + Scale(14, window), row.top, row.right - Scale(42, window), row.bottom};
+                DrawTextW(buffer, T(item.english, item.chinese), -1, &text, DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
                 RECT arrow{row.right - Scale(34, window), row.top, row.right - Scale(10, window), row.bottom};
                 SetTextColor(buffer, RGB(96, 98, 106));
                 DrawTextW(buffer, L"›", -1, &arrow, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
@@ -634,8 +791,8 @@ LRESULT CALLBACK MenuProc(HWND window, UINT message, WPARAM wParam, LPARAM lPara
             RECT row = MenuRowRect(window, static_cast<int>(index));
             if (!PtInRect(&row, point)) continue;
             const MenuItem& item = kMenuItems[index];
-            if (item.toggle) ApplyToggle(item.id);
-            else ExecuteMenuAction(item.id);
+            if (item.toggle) return 0;
+            ExecuteMenuAction(item.id);
             InvalidateRect(window, nullptr, FALSE);
             return 0;
         }
@@ -658,36 +815,93 @@ LRESULT CALLBACK MenuProc(HWND window, UINT message, WPARAM wParam, LPARAM lPara
     return DefWindowProcW(window, message, wParam, lParam);
 }
 
+void PopulateModifierCombo(HWND window, UINT controlId, WORD selectedKey) {
+    HWND combo = GetDlgItem(window, controlId);
+    for (const ModifierChoice& choice : kModifierChoices)
+        SendMessageW(combo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(T(choice.english, choice.chinese)));
+    SendMessageW(combo, CB_SETCURSEL, ModifierChoiceIndex(selectedKey), 0);
+}
+
+bool ApplySettings(HWND window) {
+    const int commandIndex = static_cast<int>(SendDlgItemMessageW(window, ID_COMMAND_COMBO, CB_GETCURSEL, 0, 0));
+    const int altIndex = static_cast<int>(SendDlgItemMessageW(window, ID_ALT_COMBO, CB_GETCURSEL, 0, 0));
+    const int controlIndex = static_cast<int>(SendDlgItemMessageW(window, ID_CONTROL_COMBO, CB_GETCURSEL, 0, 0));
+    if (commandIndex < 0 || altIndex < 0 || controlIndex < 0) return false;
+    const WORD commandKey = kModifierChoices[commandIndex].virtualKey;
+    const WORD altKey = kModifierChoices[altIndex].virtualKey;
+    const WORD controlKey = kModifierChoices[controlIndex].virtualKey;
+    if (commandKey == altKey || commandKey == controlKey || altKey == controlKey) {
+        MessageBoxW(window, T(L"Cmd, Alt, and Control must use different physical keys.",
+                               L"Cmd、Alt 和 Control 必须使用不同的物理按键。"),
+                    kAppName, MB_OK | MB_ICONWARNING);
+        return false;
+    }
+    const bool startAtLogin = Button_GetCheck(GetDlgItem(window, ID_STARTUP)) == BST_CHECKED;
+    if (!SetStartAtLogin(startAtLogin)) {
+        MessageBoxW(window, T(L"Could not update Windows startup.", L"无法更新开机启动设置。"),
+                    kAppName, MB_OK | MB_ICONERROR);
+        return false;
+    }
+    ReleaseMappedState();
+    g_commandKey = commandKey;
+    g_altKey = altKey;
+    g_controlKey = controlKey;
+    SaveDword(L"CommandKey", g_commandKey);
+    SaveDword(L"AltKey", g_altKey);
+    SaveDword(L"ControlKey", g_controlKey);
+    g_chinese = Button_GetCheck(GetDlgItem(window, ID_LANGUAGE)) == BST_CHECKED;
+    SaveDword(L"Language", g_chinese ? 1 : 0);
+    Notify(T(L"Settings saved.", L"设置已保存。"));
+    return true;
+}
+
 LRESULT CALLBACK SettingsProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
     switch (message) {
     case WM_CREATE: {
         SetRoundedWindow(window);
-        g_settingsFont = CreateUiFont(window, 15);
-        CreateWindowExW(0, L"STATIC", T(L"Interface language", L"界面语言"),
-                        WS_CHILD | WS_VISIBLE, Scale(22, window), Scale(22, window), Scale(280, window), Scale(28, window),
+        g_settingsFont = CreateUiFont(window, 14);
+        HWND startup = CreateWindowExW(0, L"BUTTON", T(L"Start with Windows", L"开机启动"),
+                                       WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX | BS_RIGHTBUTTON,
+                                       Scale(22, window), Scale(18, window), Scale(386, window), Scale(34, window),
+                                       window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_STARTUP)), g_instance, nullptr);
+        CreateWindowExW(0, L"STATIC", T(L"Shortcut mapping", L"快捷键映射"),
+                        WS_CHILD | WS_VISIBLE, Scale(22, window), Scale(66, window), Scale(386, window), Scale(26, window),
                         window, nullptr, g_instance, nullptr);
+        const wchar_t* labels[] = {L"Cmd", L"Alt", L"Control"};
+        const UINT comboIds[] = {ID_COMMAND_COMBO, ID_ALT_COMBO, ID_CONTROL_COMBO};
+        for (int index = 0; index < 3; ++index) {
+            CreateWindowExW(0, L"STATIC", labels[index], WS_CHILD | WS_VISIBLE,
+                            Scale(32, window), Scale(102 + index * 48, window), Scale(90, window), Scale(28, window),
+                            window, nullptr, g_instance, nullptr);
+            CreateWindowExW(0, WC_COMBOBOXW, L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST | WS_VSCROLL,
+                            Scale(132, window), Scale(98 + index * 48, window), Scale(276, window), Scale(220, window),
+                            window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(comboIds[index])), g_instance, nullptr);
+        }
         HWND chinese = CreateWindowExW(0, L"BUTTON", T(L"Use Simplified Chinese", L"使用简体中文"),
                                        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
-                                       Scale(22, window), Scale(56, window), Scale(280, window), Scale(34, window),
+                                       Scale(22, window), Scale(252, window), Scale(386, window), Scale(32, window),
                                        window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_LANGUAGE)), g_instance, nullptr);
-        CreateWindowExW(0, L"BUTTON", T(L"Close", L"关闭"),
+        CreateWindowExW(0, L"BUTTON", T(L"Save", L"保存"),
                         WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
-                        Scale(210, window), Scale(120, window), Scale(100, window), Scale(34, window),
+                        Scale(222, window), Scale(300, window), Scale(92, window), Scale(34, window),
+                        window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_SETTINGS_SAVE)), g_instance, nullptr);
+        CreateWindowExW(0, L"BUTTON", T(L"Close", L"关闭"),
+                        WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+                        Scale(322, window), Scale(300, window), Scale(92, window), Scale(34, window),
                         window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_SETTINGS_CLOSE)), g_instance, nullptr);
         for (HWND child = GetWindow(window, GW_CHILD); child; child = GetWindow(child, GW_HWNDNEXT)) {
             SetWindowTheme(child, L"Explorer", nullptr);
             SendMessageW(child, WM_SETFONT, reinterpret_cast<WPARAM>(g_settingsFont), TRUE);
         }
+        Button_SetCheck(startup, g_startAtLogin ? BST_CHECKED : BST_UNCHECKED);
         Button_SetCheck(chinese, g_chinese ? BST_CHECKED : BST_UNCHECKED);
+        PopulateModifierCombo(window, ID_COMMAND_COMBO, g_commandKey);
+        PopulateModifierCombo(window, ID_ALT_COMBO, g_altKey);
+        PopulateModifierCombo(window, ID_CONTROL_COMBO, g_controlKey);
         return 0;
     }
     case WM_COMMAND:
-        if (LOWORD(wParam) == ID_LANGUAGE && HIWORD(wParam) == BN_CLICKED) {
-            g_chinese = Button_GetCheck(GetDlgItem(window, ID_LANGUAGE)) == BST_CHECKED;
-            SaveDword(L"Language", g_chinese ? 1 : 0);
-            SetWindowTextW(window, T(L"Settings", L"设置"));
-            return 0;
-        }
+        if (LOWORD(wParam) == ID_SETTINGS_SAVE) { ApplySettings(window); return 0; }
         if (LOWORD(wParam) == ID_SETTINGS_CLOSE) { DestroyWindow(window); return 0; }
         break;
     case WM_CLOSE:
@@ -746,12 +960,6 @@ bool RegisterClasses() {
         case kShowMenuMessage:
             ShowMenu(window);
             return 0;
-        case WM_TIMER:
-            if (wParam == kSleepTimer) {
-                KillTimer(window, kSleepTimer);
-                SetSuspendState(FALSE, FALSE, FALSE);
-            }
-            return 0;
         case WM_HOTKEY:
             if (wParam == 1) TurnOffDisplay();
             return 0;
@@ -770,7 +978,7 @@ bool RegisterClasses() {
         }
         case WM_DESTROY:
             RemoveClipboardFormatListener(window);
-            ApplyPreventSleep();
+            SetThreadExecutionState(ES_CONTINUOUS);
             UnregisterHotKey(window, 1);
             if (g_keyboardHook) { UnhookWindowsHookEx(g_keyboardHook); g_keyboardHook = nullptr; }
             if (g_menuWindow) DestroyWindow(g_menuWindow);
@@ -834,9 +1042,14 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     InitCommonControlsEx(&controls);
     InitializeLanguage();
     g_macMapping = LoadDword(L"MacMapping", 0) != 0;
-    g_sleepWithDisplay = LoadDword(L"SleepWithDisplay", 0) != 0;
+    g_displayOffAwake = LoadDword(L"DisplayOffAwake", 0) != 0;
     g_preventSleep = LoadDword(L"PreventSleep", 0) != 0;
     g_saveScreenshots = LoadDword(L"SaveScreenshots", 0) != 0;
+    g_startAtLogin = LoadDword(L"StartAtLogin", 1) != 0;
+    LoadModifierMappings();
+#ifndef _DEBUG
+    SetStartAtLogin(g_startAtLogin);
+#endif
     g_taskbarCreated = RegisterWindowMessageW(L"TaskbarCreated");
     if (!RegisterClasses()) return 1;
 

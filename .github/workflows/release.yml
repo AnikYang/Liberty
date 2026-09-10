@@ -17,6 +17,8 @@ jobs:
         run: cmake -S . -B build -A x64
       - name: Build Release x64
         run: cmake --build build --config Release --parallel
+      - name: Regression tests
+        run: ctest --test-dir build -C Release --output-on-failure
       - name: Prepare portable package
         shell: pwsh
         run: |
@@ -37,4 +39,9 @@ jobs:
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$env:GITHUB_REF_NAME" Liberty.exe SHA256SUMS.txt assets/liberty-trinity.svg assets/liberty-trinity-mono.svg --title "Liberty $env:GITHUB_REF_NAME" --generate-notes
+        run: |
+          $releaseArgs = @('release', 'create', $env:GITHUB_REF_NAME, 'Liberty.exe', 'SHA256SUMS.txt', 'assets/liberty-trinity.svg', 'assets/liberty-trinity-mono.svg', '--title', "Liberty by Bada $env:GITHUB_REF_NAME")
+          if ($env:GITHUB_REF_NAME -match '-') { $releaseArgs += '--prerelease' }
+          if ($env:GITHUB_REF_NAME -like 'v0.1.2*') { $releaseArgs += @('--notes-file', 'docs/release-0.1.2.md') }
+          else { $releaseArgs += '--generate-notes' }
+          gh @releaseArgs

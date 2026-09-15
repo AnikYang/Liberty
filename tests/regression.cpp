@@ -13,7 +13,7 @@ int main() {
     g_instance = GetModuleHandleW(nullptr);
     Gdiplus::GdiplusStartupInput gdip;
     Gdiplus::GdiplusStartup(&g_gdiplusToken, &gdip, nullptr);
-    INITCOMMONCONTROLSEX controls{sizeof(controls), ICC_STANDARD_CLASSES};
+    INITCOMMONCONTROLSEX controls{sizeof(controls), ICC_STANDARD_CLASSES | ICC_DATE_CLASSES};
     InitCommonControlsEx(&controls);
     int result = 0;
     try {
@@ -22,6 +22,62 @@ int main() {
             Check(liberty::ParseShutdownMinutes(value, minutes), "valid shutdown duration");
         for (const wchar_t* value : {L"", L"0", L"-1", L"1.5", L"10081", L"999999999999999", L" 60", L"60x", L"+2"})
             Check(!liberty::ParseShutdownMinutes(value, minutes), "invalid duration rejected without scheduling");
+
+        DYNAMIC_TIME_ZONE_INFORMATION utcZone{};
+        wcscpy_s(utcZone.TimeZoneKeyName, L"UTC");
+        auto date = [](WORD year, WORD month, WORD day, WORD hour, WORD minute, WORD second = 0) {
+            SYSTEMTIME result{};
+            result.wYear = year; result.wMonth = month; result.wDay = day;
+            result.wHour = hour; result.wMinute = minute; result.wSecond = second;
+            return result;
+        };
+        auto ticks = [](const SYSTEMTIME& time) {
+            FILETIME file{};
+            if (!SystemTimeToFileTime(&time, &file)) throw std::runtime_error("invalid test timestamp");
+            return liberty::FileTimeTicks(file);
+        };
+        DWORD seconds = 0;
+        ULONGLONG target = 0;
+        using TimeError = liberty::ShutdownTimeError;
+        Check(liberty::ResolveShutdownTime(date(2026, 9, 15, 21, 0), ticks(date(2026, 9, 15, 20, 59, 42)), seconds, target, &utcZone) == TimeError::None && seconds == 18,
+            "21:00 uses second precision rather than rounding to minutes");
+        Check(liberty::ResolveShutdownTime(date(2026, 9, 16, 8, 0), ticks(date(2026, 9, 15, 23, 30)), seconds, target, &utcZone) == TimeError::None && seconds == 30600,
+            "tomorrow 08:00 crosses midnight correctly");
+        Check(liberty::ResolveShutdownTime(date(2027, 1, 1, 0, 0), ticks(date(2026, 12, 31, 23, 59, 40)), seconds, target, &utcZone) == TimeError::None && seconds == 20,
+            "midnight crosses year boundary");
+        Check(liberty::ResolveShutdownTime(date(2028, 2, 29, 8, 0), ticks(date(2028, 2, 28, 8, 0)), seconds, target, &utcZone) == TimeError::None && seconds == 86400,
+            "leap-day date supported");
+        Check(liberty::ResolveShutdownTime(date(2026, 2, 29, 8, 0), ticks(date(2026, 2, 28, 8, 0)), seconds, target, &utcZone) == TimeError::Invalid,
+            "invalid calendar date rejected");
+        Check(liberty::ResolveShutdownTime(date(2026, 9, 15, 8, 0), ticks(date(2026, 9, 15, 21, 0)), seconds, target, &utcZone) == TimeError::Past,
+            "past clock time rejected without immediate shutdown");
+        const ULONGLONG fixedNow = ticks(date(2026, 9, 15, 12, 0));
+        Check(liberty::SecondsUntil(fixedNow, fixedNow, seconds) == TimeError::Past, "equal current time rejected");
+        Check(liberty::SecondsUntil(fixedNow + 1, fixedNow, seconds) == TimeError::None && seconds == 1, "fractional second rounds up, never timeout zero");
+        Check(liberty::SecondsUntil(fixedNow + 604800 * liberty::kFileTimeSecond, fixedNow, seconds) == TimeError::None && seconds == 604800,
+            "seven-day limit accepted");
+        Check(liberty::SecondsUntil(fixedNow + 604801 * liberty::kFileTimeSecond, fixedNow, seconds) == TimeError::TooFar, "beyond seven days rejected");
+        DYNAMIC_TIME_ZONE_INFORMATION china{}; china.Bias = -480;
+        wcscpy_s(china.TimeZoneKeyName, L"China Standard Time");
+        Check(liberty::ResolveShutdownTime(date(2026, 9, 15, 21, 0), ticks(date(2026, 9, 15, 12, 59, 42)), seconds, target, &china) == TimeError::None && seconds == 18,
+            "local UTC+8 time resolves to correct UTC instant");
+        SYSTEMTIME restoredTime{};
+        Check(liberty::UtcTicksToLocal(target, restoredTime, &china) && restoredTime.wHour == 21 && restoredTime.wMinute == 0,
+            "saved UTC target restores local date and time");
+
+        HWND shutdownDialog = CreateDialogParamW(g_instance, MAKEINTRESOURCEW(IDD_SHUTDOWN), nullptr, ShutdownProc, 0);
+        Check(shutdownDialog != nullptr, "native date/time dialog resource loads");
+        Check(ShutdownUsesClock(shutdownDialog) && GetDlgItem(shutdownDialog, IDC_SHUTDOWN_DATE) && GetDlgItem(shutdownDialog, IDC_SHUTDOWN_TIME),
+            "specified-time mode and date/time controls present");
+        Check(ReadShutdownClock(shutdownDialog, restoredTime) && restoredTime.wSecond == 0 && restoredTime.wMilliseconds == 0,
+            "native time selection resolves to exact minute boundary");
+        SendMessageW(GetDlgItem(shutdownDialog, IDC_SHUTDOWN_DURATION_MODE), BM_CLICK, 0, 0);
+        Check(!ShutdownUsesClock(shutdownDialog) && (GetWindowLongPtrW(GetDlgItem(shutdownDialog, IDC_SHUTDOWN_MINUTES), GWL_STYLE) & WS_VISIBLE) &&
+            !(GetWindowLongPtrW(GetDlgItem(shutdownDialog, IDC_SHUTDOWN_DATE), GWL_STYLE) & WS_VISIBLE), "mode switch displays duration inputs only");
+        SendMessageW(GetDlgItem(shutdownDialog, IDC_SHUTDOWN_TIME_MODE), BM_CLICK, 0, 0);
+        Check(ShutdownUsesClock(shutdownDialog) && (GetWindowLongPtrW(GetDlgItem(shutdownDialog, IDC_SHUTDOWN_DATE), GWL_STYLE) & WS_VISIBLE) &&
+            !(GetWindowLongPtrW(GetDlgItem(shutdownDialog, IDC_SHUTDOWN_MINUTES), GWL_STYLE) & WS_VISIBLE), "mode switch displays clock inputs only");
+        DestroyWindow(shutdownDialog);
 
         Check(RegisterClasses(), "window classes registered");
         const UINT ids[] = {ID_MAC_MAPPING, ID_SLEEP_WITH_DISPLAY, ID_PREVENT_SLEEP, ID_SAVE_SCREENSHOTS, ID_PREVENT_LOCK};
@@ -109,6 +165,7 @@ int main() {
         result = 1;
     }
     if (g_menuWindow) DestroyWindow(g_menuWindow);
+    if (g_shutdownWindow) DestroyWindow(g_shutdownWindow);
     SetThreadExecutionState(ES_CONTINUOUS);
     RegDeleteTreeW(HKEY_CURRENT_USER, kRegistryKey);
     if (g_gdiplusToken) Gdiplus::GdiplusShutdown(g_gdiplusToken);

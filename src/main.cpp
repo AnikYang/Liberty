@@ -645,7 +645,7 @@ void OpenCacheCleanup() {
 
 void ShowAbout() {
     MessageBoxW(g_menuWindow ? g_menuWindow : g_window,
-                T(L"Liberty by Bada 0.1.2\n\nA small Windows control panel.", L"Liberty by Bada 0.1.2\n\n一个简约的 Windows 控制面板。"),
+                T(L"Liberty by Bada 0.1.3\n\nA small Windows control panel.", L"Liberty by Bada 0.1.3\n\n一个简约的 Windows 控制面板。"),
                 kAppName, MB_OK | MB_ICONINFORMATION);
 }
 
@@ -660,6 +660,36 @@ void UpdateMenuToggles() {
 
 void ShowMenu(HWND owner);
 
+bool ShutdownUsesClock(HWND window) {
+    return Button_GetCheck(GetDlgItem(window, IDC_SHUTDOWN_TIME_MODE)) == BST_CHECKED;
+}
+
+bool ReadShutdownClock(HWND window, SYSTEMTIME& local) {
+    SYSTEMTIME time{};
+    if (SendDlgItemMessageW(window, IDC_SHUTDOWN_DATE, DTM_GETSYSTEMTIME, 0, reinterpret_cast<LPARAM>(&local)) != GDT_VALID ||
+        SendDlgItemMessageW(window, IDC_SHUTDOWN_TIME, DTM_GETSYSTEMTIME, 0, reinterpret_cast<LPARAM>(&time)) != GDT_VALID) return false;
+    local.wHour = time.wHour;
+    local.wMinute = time.wMinute;
+    local.wSecond = 0;
+    local.wMilliseconds = 0;
+    return true;
+}
+
+std::wstring ShutdownClockLabel(const SYSTEMTIME& local) {
+    wchar_t buffer[64]{};
+    swprintf_s(buffer, L"%04u-%02u-%02u  %02u:%02u", local.wYear, local.wMonth, local.wDay, local.wHour, local.wMinute);
+    return buffer;
+}
+
+void ShowShutdownMode(HWND window) {
+    const bool clock = ShutdownUsesClock(window);
+    for (int id : {IDC_SHUTDOWN_PRESET_LABEL, IDC_SHUTDOWN_PRESET, IDC_SHUTDOWN_LABEL, IDC_SHUTDOWN_MINUTES})
+        ShowWindow(GetDlgItem(window, id), clock ? SW_HIDE : SW_SHOW);
+    for (int id : {IDC_SHUTDOWN_DATE_LABEL, IDC_SHUTDOWN_DATE, IDC_SHUTDOWN_TIME_LABEL, IDC_SHUTDOWN_TIME})
+        ShowWindow(GetDlgItem(window, id), clock ? SW_SHOW : SW_HIDE);
+    SetDlgItemTextW(window, IDC_SHUTDOWN_START, clock ? T(L"Schedule", L"设定关机") : T(L"Start timer", L"开始计时"));
+}
+
 void RefreshShutdownDialog(HWND window) {
     const bool active = g_shutdown.Active();
     std::wstring status = T(L"No shutdown scheduled.", L"尚未设置定时关机。");
@@ -670,12 +700,26 @@ void RefreshShutdownDialog(HWND window) {
             seconds / 3600, seconds / 60 % 60, seconds % 60);
         else swprintf_s(buffer, L"%s", T(L"Shutdown requested. Unsaved work may need attention.", L"已请求关机；未保存的工作可能需要处理。"));
         status = buffer;
+        SYSTEMTIME target{};
+        if (g_shutdown.TargetUtc() && liberty::UtcTicksToLocal(g_shutdown.TargetUtc(), target))
+            status = T(L"Scheduled: ", L"计划关机：") + ShutdownClockLabel(target) + L"\n" + status;
+    } else if (ShutdownUsesClock(window)) {
+        SYSTEMTIME selected{};
+        DWORD seconds = 0;
+        ULONGLONG target = 0;
+        if (ReadShutdownClock(window, selected) &&
+            liberty::ResolveShutdownTime(selected, liberty::UtcNowTicks(), seconds, target) == liberty::ShutdownTimeError::None)
+            status = T(L"Ready to schedule: ", L"待设定：") + ShutdownClockLabel(selected) +
+                T(L" (local time)\nClick Schedule to confirm.", L"（本地时间）\n点击“设定关机”后生效。");
+        else status = T(L"Choose a future date and time within 7 days.", L"请选择未来 7 天内的日期和时间。\n例如今天 21:00，或明天 08:00。");
     }
     SetDlgItemTextW(window, IDC_SHUTDOWN_STATUS, status.c_str());
     EnableWindow(GetDlgItem(window, IDC_SHUTDOWN_START), !active);
     EnableWindow(GetDlgItem(window, IDC_SHUTDOWN_CANCEL), active);
     EnableWindow(GetDlgItem(window, IDC_SHUTDOWN_PRESET), !active);
     EnableWindow(GetDlgItem(window, IDC_SHUTDOWN_MINUTES), !active);
+    for (int id : {IDC_SHUTDOWN_DURATION_MODE, IDC_SHUTDOWN_TIME_MODE, IDC_SHUTDOWN_DATE, IDC_SHUTDOWN_TIME})
+        EnableWindow(GetDlgItem(window, id), !active);
 }
 
 void ShutdownError(HWND window, DWORD error) {
@@ -684,6 +728,9 @@ void ShutdownError(HWND window, DWORD error) {
         message = T(L"Windows already has a shutdown pending. Cancel it before scheduling another.", L"Windows 已有待执行的关机，请先取消后再设置。");
     else if (error == ERROR_PRIVILEGE_NOT_HELD || error == ERROR_NOT_ALL_ASSIGNED || error == ERROR_ACCESS_DENIED)
         message = T(L"This Windows account is not allowed to schedule shutdown.", L"当前 Windows 账户没有设置关机的权限。");
+    else if (error == ERROR_INVALID_TIME)
+        message = T(L"Choose a valid future date and time within 7 days. If today's time has passed, select tomorrow.",
+            L"请选择未来 7 天内的有效时间。如果今天的时刻已过，请把日期改为明天。");
     else {
         wchar_t detail[512]{};
         FormatMessageW(FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS, nullptr, error, 0, detail, ARRAYSIZE(detail), nullptr);
@@ -694,20 +741,24 @@ void ShutdownError(HWND window, DWORD error) {
     MessageBoxW(window, message.c_str(), kAppName, MB_OK | MB_ICONERROR);
 }
 
-INT_PTR CALLBACK ShutdownProc(HWND window, UINT message, WPARAM wParam, LPARAM) {
+INT_PTR CALLBACK ShutdownProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
     switch (message) {
     case WM_INITDIALOG: {
         g_shutdownWindow = window;
         SetRoundedWindow(window);
         SetWindowTextW(window, T(L"Scheduled shutdown - Liberty by Bada", L"定时关机 — Liberty by Bada"));
+        SetDlgItemTextW(window, IDC_SHUTDOWN_DURATION_MODE, T(L"After a duration", L"倒计时关机"));
+        SetDlgItemTextW(window, IDC_SHUTDOWN_TIME_MODE, T(L"At a date and time", L"指定时间关机"));
+        SetDlgItemTextW(window, IDC_SHUTDOWN_DATE_LABEL, T(L"Date", L"关机日期"));
+        SetDlgItemTextW(window, IDC_SHUTDOWN_TIME_LABEL, T(L"Time (24-hour)", L"时间（24 小时制）"));
         SetDlgItemTextW(window, IDC_SHUTDOWN_PRESET_LABEL, T(L"Duration", L"常用时长"));
         SetDlgItemTextW(window, IDC_SHUTDOWN_LABEL, T(L"Minutes (1-10080)", L"分钟（1–10080）"));
         SetDlgItemTextW(window, IDC_SHUTDOWN_START, T(L"Start timer", L"开始计时"));
         SetDlgItemTextW(window, IDC_SHUTDOWN_CANCEL, T(L"Cancel timer", L"取消关机"));
         SetDlgItemTextW(window, IDCANCEL, T(L"Back", L"返回"));
         SetDlgItemTextW(window, IDC_SHUTDOWN_HINT, T(
-            L"Windows keeps the timer when this window or Liberty closes. Unsaved apps will not be forcibly closed.",
-            L"关闭本窗口或退出 Liberty 后仍会按时关机。不会强制关闭有未保存内容的应用。"));
+            L"Uses your PC's local time. The schedule remains after closing Liberty. Unsaved apps may prevent shutdown. Cancel and reschedule after changing the system clock.",
+            L"按电脑本地时间执行。关闭 Liberty 后计划仍有效，未保存的工作可能阻止关机。调整系统时钟后请取消并重新设定。"));
         const wchar_t* english[] = {L"15 minutes", L"30 minutes", L"1 hour", L"2 hours", L"Custom"};
         const wchar_t* chinese[] = {L"15 分钟", L"30 分钟", L"1 小时", L"2 小时", L"自定义"};
         for (int i = 0; i < 5; ++i)
@@ -717,16 +768,45 @@ INT_PTR CALLBACK ShutdownProc(HWND window, UINT message, WPARAM wParam, LPARAM) 
         SetDlgItemTextW(window, IDC_SHUTDOWN_MINUTES, std::to_wstring(initialMinutes).c_str());
         SendDlgItemMessageW(window, IDC_SHUTDOWN_PRESET, CB_SETCURSEL, initialIndex, 0);
         SendDlgItemMessageW(window, IDC_SHUTDOWN_MINUTES, EM_SETLIMITTEXT, 16, 0);
+        const bool clock = g_shutdown.Active() ? g_shutdown.AtTime() : LoadDword(L"ShutdownClockMode", 1) != 0;
+        CheckRadioButton(window, IDC_SHUTDOWN_DURATION_MODE, IDC_SHUTDOWN_TIME_MODE,
+            clock ? IDC_SHUTDOWN_TIME_MODE : IDC_SHUTDOWN_DURATION_MODE);
+        SendDlgItemMessageW(window, IDC_SHUTDOWN_DATE, DTM_SETFORMATW, 0, reinterpret_cast<LPARAM>(L"yyyy-MM-dd"));
+        SendDlgItemMessageW(window, IDC_SHUTDOWN_TIME, DTM_SETFORMATW, 0, reinterpret_cast<LPARAM>(L"HH:mm"));
+        SYSTEMTIME selected{}, range[2]{};
+        const ULONGLONG now = liberty::UtcNowTicks();
+        const ULONGLONG minuteTicks = 60 * liberty::kFileTimeSecond;
+        const ULONGLONG defaultTime = ((now + 3600 * liberty::kFileTimeSecond + minuteTicks - 1) / minuteTicks) * minuteTicks;
+        liberty::UtcTicksToLocal(g_shutdown.Active() && g_shutdown.TargetUtc() ? g_shutdown.TargetUtc() : defaultTime, selected);
+        GetLocalTime(&range[0]);
+        liberty::UtcTicksToLocal(now + static_cast<ULONGLONG>(liberty::kMaxShutdownSeconds) * liberty::kFileTimeSecond, range[1]);
+        // An active date may be in the past if an unsaved app is blocking shutdown.
+        if (!g_shutdown.Active()) SendDlgItemMessageW(window, IDC_SHUTDOWN_DATE, DTM_SETRANGE, GDTR_MIN | GDTR_MAX, reinterpret_cast<LPARAM>(range));
+        SendDlgItemMessageW(window, IDC_SHUTDOWN_DATE, DTM_SETSYSTEMTIME, GDT_VALID, reinterpret_cast<LPARAM>(&selected));
+        SendDlgItemMessageW(window, IDC_SHUTDOWN_TIME, DTM_SETSYSTEMTIME, GDT_VALID, reinterpret_cast<LPARAM>(&selected));
+        ShowShutdownMode(window);
         RefreshShutdownDialog(window);
         SetTimer(window, 1, 1000, nullptr);
-        SetFocus(GetDlgItem(window, g_shutdown.Active() ? IDC_SHUTDOWN_CANCEL : IDC_SHUTDOWN_MINUTES));
+        SetFocus(GetDlgItem(window, g_shutdown.Active() ? IDC_SHUTDOWN_CANCEL : clock ? IDC_SHUTDOWN_TIME : IDC_SHUTDOWN_MINUTES));
         SendDlgItemMessageW(window, IDC_SHUTDOWN_MINUTES, EM_SETSEL, 0, -1);
         return FALSE;
     }
     case WM_TIMER:
         RefreshShutdownDialog(window);
         return TRUE;
+    case WM_NOTIFY:
+        if (reinterpret_cast<const NMHDR*>(lParam)->code == DTN_DATETIMECHANGE) {
+            RefreshShutdownDialog(window);
+            return TRUE;
+        }
+        break;
     case WM_COMMAND:
+        if ((LOWORD(wParam) == IDC_SHUTDOWN_DURATION_MODE || LOWORD(wParam) == IDC_SHUTDOWN_TIME_MODE) && HIWORD(wParam) == BN_CLICKED) {
+            ShowShutdownMode(window);
+            RefreshShutdownDialog(window);
+            SetFocus(GetDlgItem(window, ShutdownUsesClock(window) ? IDC_SHUTDOWN_TIME : IDC_SHUTDOWN_MINUTES));
+            return TRUE;
+        }
         if (LOWORD(wParam) == IDC_SHUTDOWN_PRESET && HIWORD(wParam) == CBN_SELCHANGE) {
             const int index = static_cast<int>(SendDlgItemMessageW(window, IDC_SHUTDOWN_PRESET, CB_GETCURSEL, 0, 0));
             const wchar_t* values[] = {L"15", L"30", L"60", L"120"};
@@ -746,6 +826,34 @@ INT_PTR CALLBACK ShutdownProc(HWND window, UINT message, WPARAM wParam, LPARAM) 
         }
         if (LOWORD(wParam) == IDC_SHUTDOWN_START || LOWORD(wParam) == IDOK) {
             if (g_shutdown.Active()) return TRUE;
+            const bool clock = ShutdownUsesClock(window);
+            if (clock) {
+                const HWND calendar = reinterpret_cast<HWND>(SendDlgItemMessageW(window, IDC_SHUTDOWN_DATE, DTM_GETMONTHCAL, 0, 0));
+                if (LOWORD(wParam) == IDOK && calendar && IsWindowVisible(calendar)) {
+                    // Enter used to finish a calendar selection must not also start shutdown.
+                    SendDlgItemMessageW(window, IDC_SHUTDOWN_DATE, DTM_CLOSEMONTHCAL, 0, 0);
+                    SetFocus(GetDlgItem(window, IDC_SHUTDOWN_TIME));
+                    return TRUE;
+                }
+                // Commit any partially typed native time field before reading the target.
+                SetFocus(GetDlgItem(window, IDC_SHUTDOWN_START));
+                SYSTEMTIME selected{};
+                DWORD seconds = 0;
+                ULONGLONG target = 0;
+                if (!ReadShutdownClock(window, selected) ||
+                    liberty::ResolveShutdownTime(selected, liberty::UtcNowTicks(), seconds, target) != liberty::ShutdownTimeError::None) {
+                    ShutdownError(window, ERROR_INVALID_TIME);
+                    SetFocus(GetDlgItem(window, IDC_SHUTDOWN_DATE));
+                    return TRUE;
+                }
+                DWORD error = g_shutdown.Open(kRegistryKey);
+                if (!error) error = g_shutdown.StartAt(selected, T(L"Liberty by Bada: scheduled shutdown. Save your work.", L"Liberty by Bada：定时关机，请保存工作。"));
+                if (error) ShutdownError(window, error);
+                else SaveDword(L"ShutdownClockMode", 1);
+                RefreshShutdownDialog(window);
+                if (!error) SetFocus(GetDlgItem(window, IDC_SHUTDOWN_CANCEL));
+                return TRUE;
+            }
             wchar_t text[32]{};
             GetDlgItemTextW(window, IDC_SHUTDOWN_MINUTES, text, ARRAYSIZE(text));
             DWORD minutes = 0;
@@ -758,6 +866,7 @@ INT_PTR CALLBACK ShutdownProc(HWND window, UINT message, WPARAM wParam, LPARAM) 
             DWORD error = g_shutdown.Open(kRegistryKey);
             if (!error) error = g_shutdown.Start(minutes, T(L"Liberty by Bada: scheduled shutdown. Save your work.", L"Liberty by Bada：定时关机，请保存工作。"));
             if (error) ShutdownError(window, error);
+            else SaveDword(L"ShutdownClockMode", 0);
             RefreshShutdownDialog(window);
             if (!error) SetFocus(GetDlgItem(window, IDC_SHUTDOWN_CANCEL));
             return TRUE;
@@ -1320,7 +1429,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     Gdiplus::GdiplusStartupInput gdiplusInput;
     Gdiplus::GdiplusStartup(&g_gdiplusToken, &gdiplusInput, nullptr);
-    INITCOMMONCONTROLSEX controls{sizeof(controls), ICC_STANDARD_CLASSES};
+    INITCOMMONCONTROLSEX controls{sizeof(controls), ICC_STANDARD_CLASSES | ICC_DATE_CLASSES};
     InitCommonControlsEx(&controls);
     InitializeLanguage();
     g_macMapping = LoadDword(L"MacMapping", 0) != 0;

@@ -3,12 +3,16 @@
 #include "../src/shutdown.hpp"
 #include <cstdio>
 
-int main() {
+int main(int argc, char** argv) {
     liberty::ShutdownSchedule schedule;
     DWORD error = schedule.Open(L"Software\\LibertyByBadaShutdownIntegration");
     if (error) { std::printf("OPEN_FAILED %lu\n", error); return 1; }
     if (schedule.Active()) { std::puts("Existing test schedule; cancel it before retrying."); return 1; }
-    error = schedule.Start(60, L"Liberty integration test: 60-minute timer, cancelled immediately.");
+    const bool atTime = argc > 1 && std::string_view(argv[1]) == "--at-time";
+    SYSTEMTIME target{};
+    if (atTime) liberty::UtcTicksToLocal(liberty::UtcNowTicks() + 3600 * liberty::kFileTimeSecond, target);
+    error = atTime ? schedule.StartAt(target, L"Liberty integration test: specified time one hour ahead, cancelled immediately.") :
+        schedule.Start(60, L"Liberty integration test: 60-minute timer, cancelled immediately.");
     if (error) { std::printf("SCHEDULE_FAILED %lu (no schedule created)\n", error); return 1; }
     struct CancelGuard {
         liberty::ShutdownSchedule& schedule;
@@ -18,7 +22,9 @@ int main() {
     std::fflush(stdout);
     liberty::ShutdownSchedule reopened;
     const DWORD reopenedError = reopened.Open(L"Software\\LibertyByBadaShutdownIntegration");
-    const bool restored = !reopenedError && reopened.Active() && reopened.SecondsRemaining() > 3500;
+    const bool restored = !reopenedError && reopened.Active() && reopened.SecondsRemaining() > 3500 &&
+        reopened.AtTime() == atTime && reopened.TargetUtc() == schedule.TargetUtc();
+    std::printf("RESTORED_MODE atTime=%d targetUtc=%llu\n", reopened.AtTime(), reopened.TargetUtc());
     error = schedule.Cancel();
     std::printf("REAL_WINDOWS_SHUTDOWN_CANCELLED result=%lu restored=%d\n", error, restored);
     if (error) return 1;

@@ -23,6 +23,21 @@ int main() {
         for (const wchar_t* value : {L"", L"0", L"-1", L"1.5", L"10081", L"999999999999999", L" 60", L"60x", L"+2"})
             Check(!liberty::ParseShutdownMinutes(value, minutes), "invalid duration rejected without scheduling");
 
+        std::vector<WORD> dailyTimes{23 * 60 + 30, 8 * 60 + 5, 23 * 60 + 30};
+        Check(liberty::NormalizeDailyShutdownTimes(dailyTimes) &&
+            dailyTimes == std::vector<WORD>({8 * 60 + 5, 23 * 60 + 30}),
+            "daily times sort and deduplicate");
+        Check(liberty::DailyShutdownTimeLabel(dailyTimes[0]) == L"08:05", "daily time uses 24-hour label");
+        SYSTEMTIME boundaryDate{};
+        boundaryDate.wYear = 2026; boundaryDate.wMonth = 9; boundaryDate.wDay = 16;
+        Check(liberty::DailyShutdownBoundary(23 * 60 + 30, boundaryDate) == L"2026-09-16T23:30:00",
+            "daily trigger starts at local calendar time");
+        dailyTimes.assign(25, 1);
+        for (WORD index = 0; index < dailyTimes.size(); ++index) dailyTimes[index] = index;
+        Check(!liberty::NormalizeDailyShutdownTimes(dailyTimes), "daily schedule rejects more than 24 distinct times");
+        dailyTimes = {1440};
+        Check(!liberty::NormalizeDailyShutdownTimes(dailyTimes), "daily schedule rejects invalid clock time");
+
         DYNAMIC_TIME_ZONE_INFORMATION utcZone{};
         wcscpy_s(utcZone.TimeZoneKeyName, L"UTC");
         auto date = [](WORD year, WORD month, WORD day, WORD hour, WORD minute, WORD second = 0) {
@@ -66,16 +81,27 @@ int main() {
             "saved UTC target restores local date and time");
 
         HWND shutdownDialog = CreateDialogParamW(g_instance, MAKEINTRESOURCEW(IDD_SHUTDOWN), nullptr, ShutdownProc, 0);
-        Check(shutdownDialog != nullptr, "native date/time dialog resource loads");
-        Check(ShutdownUsesClock(shutdownDialog) && GetDlgItem(shutdownDialog, IDC_SHUTDOWN_DATE) && GetDlgItem(shutdownDialog, IDC_SHUTDOWN_TIME),
-            "specified-time mode and date/time controls present");
-        Check(ReadShutdownClock(shutdownDialog, restoredTime) && restoredTime.wSecond == 0 && restoredTime.wMilliseconds == 0,
-            "native time selection resolves to exact minute boundary");
+        Check(shutdownDialog != nullptr, "native daily shutdown dialog resource loads");
+        Check(ShutdownUsesDailySchedule(shutdownDialog) && GetDlgItem(shutdownDialog, IDC_SHUTDOWN_DAILY_LIST) &&
+            GetDlgItem(shutdownDialog, IDC_SHUTDOWN_TIME), "daily mode and multi-time controls present");
+        WORD selectedMinute = 0;
+        Check(ReadShutdownDailyTime(shutdownDialog, selectedMinute) && selectedMinute < 24 * 60,
+            "native daily time resolves to a valid minute");
+        SYSTEMTIME firstDaily{};
+        firstDaily.wYear = 2026; firstDaily.wMonth = 9; firstDaily.wDay = 16; firstDaily.wHour = 23; firstDaily.wMinute = 30;
+        SendDlgItemMessageW(shutdownDialog, IDC_SHUTDOWN_TIME, DTM_SETSYSTEMTIME, GDT_VALID, reinterpret_cast<LPARAM>(&firstDaily));
+        SendMessageW(shutdownDialog, WM_COMMAND, MAKEWPARAM(IDC_SHUTDOWN_DAILY_ADD, BN_CLICKED), 0);
+        firstDaily.wHour = 8; firstDaily.wMinute = 5;
+        SendDlgItemMessageW(shutdownDialog, IDC_SHUTDOWN_TIME, DTM_SETSYSTEMTIME, GDT_VALID, reinterpret_cast<LPARAM>(&firstDaily));
+        SendMessageW(shutdownDialog, WM_COMMAND, MAKEWPARAM(IDC_SHUTDOWN_DAILY_ADD, BN_CLICKED), 0);
+        SendMessageW(shutdownDialog, WM_COMMAND, MAKEWPARAM(IDC_SHUTDOWN_DAILY_ADD, BN_CLICKED), 0);
+        Check(ReadDailyShutdownList(shutdownDialog) == std::vector<WORD>({8 * 60 + 5, 23 * 60 + 30}),
+            "daily dialog keeps several sorted unique times");
         SendMessageW(GetDlgItem(shutdownDialog, IDC_SHUTDOWN_DURATION_MODE), BM_CLICK, 0, 0);
-        Check(!ShutdownUsesClock(shutdownDialog) && (GetWindowLongPtrW(GetDlgItem(shutdownDialog, IDC_SHUTDOWN_MINUTES), GWL_STYLE) & WS_VISIBLE) &&
-            !(GetWindowLongPtrW(GetDlgItem(shutdownDialog, IDC_SHUTDOWN_DATE), GWL_STYLE) & WS_VISIBLE), "mode switch displays duration inputs only");
+        Check(!ShutdownUsesDailySchedule(shutdownDialog) && (GetWindowLongPtrW(GetDlgItem(shutdownDialog, IDC_SHUTDOWN_MINUTES), GWL_STYLE) & WS_VISIBLE) &&
+            !(GetWindowLongPtrW(GetDlgItem(shutdownDialog, IDC_SHUTDOWN_DAILY_LIST), GWL_STYLE) & WS_VISIBLE), "mode switch displays duration inputs only");
         SendMessageW(GetDlgItem(shutdownDialog, IDC_SHUTDOWN_TIME_MODE), BM_CLICK, 0, 0);
-        Check(ShutdownUsesClock(shutdownDialog) && (GetWindowLongPtrW(GetDlgItem(shutdownDialog, IDC_SHUTDOWN_DATE), GWL_STYLE) & WS_VISIBLE) &&
+        Check(ShutdownUsesDailySchedule(shutdownDialog) && (GetWindowLongPtrW(GetDlgItem(shutdownDialog, IDC_SHUTDOWN_DAILY_LIST), GWL_STYLE) & WS_VISIBLE) &&
             !(GetWindowLongPtrW(GetDlgItem(shutdownDialog, IDC_SHUTDOWN_MINUTES), GWL_STYLE) & WS_VISIBLE), "mode switch displays clock inputs only");
         DestroyWindow(shutdownDialog);
 

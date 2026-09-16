@@ -1,11 +1,11 @@
 cmake_minimum_required(VERSION 3.20)
-project(Liberty VERSION 0.1.3 LANGUAGES CXX)
+project(Liberty VERSION 0.1.4 LANGUAGES CXX)
 
 add_executable(Liberty WIN32 src/main.cpp app.rc)
 target_compile_features(Liberty PRIVATE cxx_std_17)
 target_compile_definitions(Liberty PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN _WIN32_WINNT=0x0A00)
 target_link_libraries(Liberty PRIVATE
-  user32 shell32 advapi32 gdi32 comctl32 comdlg32
+  user32 shell32 advapi32 gdi32 comctl32 comdlg32 taskschd
   dwmapi gdiplus ole32 oleaut32 uxtheme wtsapi32
 )
 
@@ -30,7 +30,7 @@ if(BUILD_TESTING AND MSVC)
   target_compile_definitions(LibertyRegression PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN _WIN32_WINNT=0x0A00)
   target_compile_options(LibertyRegression PRIVATE /W4 /permissive- /utf-8)
   target_link_options(LibertyRegression PRIVATE /MANIFEST:NO)
-  target_link_libraries(LibertyRegression PRIVATE user32 shell32 advapi32 gdi32 comctl32 comdlg32 dwmapi gdiplus ole32 oleaut32 uxtheme wtsapi32)
+  target_link_libraries(LibertyRegression PRIVATE user32 shell32 advapi32 gdi32 comctl32 comdlg32 taskschd dwmapi gdiplus ole32 oleaut32 uxtheme wtsapi32)
   set_property(TARGET LibertyRegression PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
   add_test(NAME LibertyRegression COMMAND LibertyRegression)
   add_executable(LibertyDebugSession tools/debug-session.cpp)

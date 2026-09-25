@@ -1,7 +1,7 @@
 # Liberty by Bada
 
 Liberty by Bada is a compact native C++/Win32 tray panel for Windows 10/11 x64.
-Version: **0.1.4**.
+Version: **0.1.5**.
 
 The whole product surface is the single control panel below. Features outside this panel have intentionally been removed.
 
@@ -15,7 +15,7 @@ The whole product surface is the single control panel below. Features outside th
 - **防止自动锁屏** — keeps an already-unlocked session active while enabled; manual locking remains available.
 - **清理缓存 →** — opens the built-in Windows Disk Cleanup experience.
 - **将截图保存至桌面而不是剪贴板** — saves incoming clipboard screenshot bitmaps as PNG files on the Desktop, then clears that screenshot from the clipboard.
-- **定时关机 →** — save several 24-hour times that repeat every day, or use a one-time 1–10080-minute countdown.
+- **定时关机 →** — view and manage the plans that are actually registered in Windows, or use a one-time 1–10080-minute countdown.
 - **设置 →** — controls startup, shortcut mapping, and the interface language.
 - The footer opens **About Liberty by Bada**.
 
@@ -35,10 +35,13 @@ The following earlier experimental features are no longer included in the shippe
 
 Open **定时关机 / Scheduled shutdown** and choose a mode:
 
-- **每日定时关机 / Daily schedule**: choose a 24-hour time, click **添加 / Add**, and repeat for every time you need. The list is sorted and deduplicated and accepts up to 24 times. Click **保存计划 / Save schedule** once to replace the current Windows task. Each listed time repeats every day across Liberty and Windows restarts. **停用计划 / Disable schedule** removes the Windows task but retains the list for later; deleting every item and saving clears the stored list.
+- **每日定时关机 / Daily schedule**: the main menu shows whether the Windows plan is enabled and how many entries exist. The manager reads the real Windows Task Scheduler task and shows each time, enabled/disabled state and next occurrence. It also shows the task's next run and warns when the executable path needs repair.
+- **Manage plans**: **添加 / Add** applies and enables a new time immediately. Select an item to load it into the time field, then use **修改 / Edit** or **删除 / Remove**; changes take effect immediately. **刷新 / Refresh** re-reads Windows and imports changes made outside Liberty. **停用全部 / Disable all** removes the Windows task but keeps the saved rows; **启用／修复 / Enable / repair** recreates the task and updates its executable path.
 - **倒计时关机 / After a duration**: choose 15/30/60/120 minutes or enter 1–10080 whole minutes, then click **开始计时 / Start timer**.
 
-The daily schedule follows the computer's local time zone. At each selected time, Task Scheduler starts Liberty with a private `--daily-shutdown` action and Liberty begins a 60-second Windows shutdown countdown. The computer must be on, signed in and awake at the trigger time; Liberty does not wake a sleeping or powered-off computer. Moving the portable EXE requires opening the schedule and saving again so Windows learns the new path. Unsaved applications are not forced closed and may block shutdown.
+The daily schedule follows the computer's local time zone. At each selected time, Task Scheduler starts Liberty with a private `--daily-shutdown` action and Liberty begins a 60-second Windows shutdown countdown. The computer must be on, signed in and awake at the trigger time; Liberty does not wake a sleeping or powered-off computer. Moving the portable EXE causes the manager to show a path warning; click **Enable / repair** to update it. Unsaved applications are not forced closed and may block shutdown.
+
+Windows Task Scheduler is the source of truth for enabled plans. When Liberty opens the menu or manager it reconciles its saved list with the actual task, so a valid task remains visible even if the app's registry state is missing or stale. Disabled rows are retained locally for re-enabling. If the task cannot be read, the manager displays the Windows error instead of claiming that no plans exist.
 
 The duration mode remains a one-time Windows countdown. **取消关机 / Cancel timer** cancels that countdown; **返回 / Back** closes the panel without cancelling it. Existing pending Windows shutdowns are never silently replaced.
 
@@ -72,10 +75,12 @@ Liberty by Bada 是一个单页 Windows 托盘控制面板。本版在草图的�
 
 定时关机支持 15/30 分钟、1/2 小时和自定义 1–10080 分钟，开始后显示倒计时并允许取消。按 Enter 开始，按 Esc 或“返回”回到主菜单。关闭窗口或退出 Liberty 后 Windows 仍会执行计划，不会强制关闭有未保存内容的应用。请通过“取消关机”结束倒计时。重新打开 Liberty 可查看本次 Windows 会话中已保存的计划；重启电脑后旧计划不会恢复。
 
-“每日定时关机”使用电脑本地时区和 24 小时制。选择时间后点“添加”，可以继续添加多个时间；列表自动排序和去重，最多 24 个。点“保存计划”后，每个时间都会每天重复，关闭 Liberty 或重启 Windows 也不会丢失。到点时 Liberty 启动 60 秒 Windows 关机倒计时。电脑必须保持开机、登录且未休眠；未保存的工作仍可能阻止关机。移动便携版 EXE 后需要重新保存一次计划。
+“每日定时关机”使用电脑本地时区和 24 小时制。主菜单直接显示计划是否启用及数量；管理窗口从 Windows 任务计划读取实际生效内容，逐条显示时间、启用状态和下一次执行时间，顶部显示系统任务状态及最近的下一次执行。
 
-“停用计划”会删除 Windows 任务但保留时间列表，方便以后重新启用。逐项删除并保存空列表可以彻底清除时间。“倒计时关机”仍是一轮有效的临时计划，并可随时取消。
+选择时间后点“添加”会立即启用；选中已有计划后可“修改”或“删除”，操作立即写入 Windows。“刷新”会重新读取系统任务并导入外部修改。“停用全部”删除系统任务但保留时间列表；“启用／修复”会重新创建任务，并在移动 Liberty.exe 后修复程序路径。列表自动排序、去重，最多 24 条。
+
+“倒计时关机”仍是一轮有效的临时计划，并可随时取消。Windows 任务是启用状态和实际时间的真实来源；Liberty 会在打开菜单或管理窗口时自动同步，避免出现系统已有计划但软件内看不到的情况。
 
 “防止自动锁屏”默认关闭。开启后，在已解锁的会话中定期维持活动，不会移动指针。关闭该开关即停止维持。手动锁定、动态锁和组织强制策略仍然有效；不会修改 Windows 锁屏策略，也不会自动解锁。
 
-0.1.4 的 Debug/Release 回归、两个每日触发器的实机创建、重启恢复、停用及清理均已验证。测试任务和测试时间已删除，系统没有待执行关机。详情见 [本版测试记录](docs/testing-0.1.4.md)。0.1.3 的一次性指定时间实现保留在 [旧版测试记录](docs/testing-0.1.3.md)。
+0.1.5 已用现有的 01:15、01:30 系统计划完成只读验收：主菜单显示数量，管理页显示实际启用状态和下一次执行，选中后开放修改/删除，刷新后保持一致。自动回归覆盖添加、修改、删除、停用、启用、刷新及任务触发器导入。测试未改动这两条真实计划。详情见 [本版测试记录](docs/testing-0.1.5.md)。

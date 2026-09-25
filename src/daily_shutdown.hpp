@@ -13,6 +13,18 @@ constexpr size_t kMaxDailyShutdownTimes = 24;
 constexpr wchar_t kDailyShutdownTaskName[] = L"Liberty by Bada - Daily Shutdown";
 constexpr wchar_t kDailyShutdownArgument[] = L"--daily-shutdown";
 
+struct DailyShutdownTaskStatus {
+    bool exists = false;
+    bool enabled = false;
+    TASK_STATE state = TASK_STATE_UNKNOWN;
+    std::vector<WORD> times;
+    DATE nextRun = 0;
+    DATE lastRun = 0;
+    LONG lastResult = S_OK;
+    std::wstring executable;
+    std::wstring arguments;
+};
+
 inline bool NormalizeDailyShutdownTimes(std::vector<WORD>& times) {
     if (times.empty()) return false;
     if (std::any_of(times.begin(), times.end(), [](WORD value) { return value >= 24 * 60; })) return false;
@@ -32,6 +44,96 @@ inline std::wstring DailyShutdownBoundary(WORD minuteOfDay, const SYSTEMTIME& lo
     swprintf_s(buffer, L"%04u-%02u-%02uT%02u:%02u:00", localDate.wYear, localDate.wMonth,
         localDate.wDay, minuteOfDay / 60, minuteOfDay % 60);
     return buffer;
+}
+
+inline bool ParseDailyShutdownBoundary(std::wstring_view boundary, WORD& minuteOfDay) {
+    const size_t separator = boundary.find(L'T');
+    if (separator == std::wstring_view::npos || separator + 6 > boundary.size()) return false;
+    const wchar_t h0 = boundary[separator + 1], h1 = boundary[separator + 2];
+    const wchar_t colon = boundary[separator + 3];
+    const wchar_t m0 = boundary[separator + 4], m1 = boundary[separator + 5];
+    if (h0 < L'0' || h0 > L'9' || h1 < L'0' || h1 > L'9' || colon != L':' ||
+        m0 < L'0' || m0 > L'9' || m1 < L'0' || m1 > L'9') return false;
+    const WORD hour = static_cast<WORD>((h0 - L'0') * 10 + h1 - L'0');
+    const WORD minute = static_cast<WORD>((m0 - L'0') * 10 + m1 - L'0');
+    if (hour > 23 || minute > 59) return false;
+    minuteOfDay = static_cast<WORD>(hour * 60 + minute);
+    return true;
+}
+
+inline HRESULT QueryDailyShutdownTask(DailyShutdownTaskStatus& status) {
+    using Microsoft::WRL::ComPtr;
+    status = {};
+    ComPtr<ITaskService> service;
+    HRESULT result = CoCreateInstance(CLSID_TaskScheduler, nullptr, CLSCTX_INPROC_SERVER,
+        IID_PPV_ARGS(&service));
+    if (FAILED(result)) return result;
+    VARIANT empty{};
+    VariantInit(&empty);
+    result = service->Connect(empty, empty, empty, empty);
+    if (FAILED(result)) return result;
+    ComPtr<ITaskFolder> root;
+    BSTR rootPath = SysAllocString(L"\\");
+    if (!rootPath) return E_OUTOFMEMORY;
+    result = service->GetFolder(rootPath, &root);
+    SysFreeString(rootPath);
+    if (FAILED(result)) return result;
+    BSTR name = SysAllocString(kDailyShutdownTaskName);
+    if (!name) return E_OUTOFMEMORY;
+    ComPtr<IRegisteredTask> task;
+    result = root->GetTask(name, &task);
+    SysFreeString(name);
+    constexpr HRESULT taskNotFound = static_cast<HRESULT>(0x8004130FL);
+    if (result == HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND) || result == taskNotFound) return S_OK;
+    if (FAILED(result)) return result;
+    status.exists = true;
+    VARIANT_BOOL enabled = VARIANT_FALSE;
+    if (FAILED(result = task->get_Enabled(&enabled)) || FAILED(result = task->get_State(&status.state))) return result;
+    status.enabled = enabled == VARIANT_TRUE && status.state != TASK_STATE_DISABLED;
+    task->get_NextRunTime(&status.nextRun);
+    task->get_LastRunTime(&status.lastRun);
+    task->get_LastTaskResult(&status.lastResult);
+
+    ComPtr<ITaskDefinition> definition;
+    if (FAILED(result = task->get_Definition(&definition))) return result;
+    ComPtr<ITriggerCollection> triggers;
+    if (FAILED(result = definition->get_Triggers(&triggers))) return result;
+    LONG triggerCount = 0;
+    if (FAILED(result = triggers->get_Count(&triggerCount))) return result;
+    for (LONG index = 1; index <= triggerCount; ++index) {
+        ComPtr<ITrigger> trigger;
+        if (FAILED(result = triggers->get_Item(index, &trigger))) return result;
+        TASK_TRIGGER_TYPE2 type = TASK_TRIGGER_EVENT;
+        VARIANT_BOOL triggerEnabled = VARIANT_FALSE;
+        if (FAILED(trigger->get_Type(&type)) || FAILED(trigger->get_Enabled(&triggerEnabled)) ||
+            type != TASK_TRIGGER_DAILY || triggerEnabled != VARIANT_TRUE) continue;
+        BSTR boundary = nullptr;
+        if (FAILED(result = trigger->get_StartBoundary(&boundary))) return result;
+        WORD minute = 0;
+        const bool parsed = boundary && ParseDailyShutdownBoundary(boundary, minute);
+        if (boundary) SysFreeString(boundary);
+        if (parsed) status.times.push_back(minute);
+    }
+    if (!status.times.empty() && !NormalizeDailyShutdownTimes(status.times)) status.times.clear();
+
+    ComPtr<IActionCollection> actions;
+    if (SUCCEEDED(definition->get_Actions(&actions))) {
+        LONG actionCount = 0;
+        if (SUCCEEDED(actions->get_Count(&actionCount)) && actionCount > 0) {
+            ComPtr<IAction> action;
+            if (SUCCEEDED(actions->get_Item(1, &action))) {
+                ComPtr<IExecAction> exec;
+                if (SUCCEEDED(action.As(&exec))) {
+                    BSTR path = nullptr, arguments = nullptr;
+                    if (SUCCEEDED(exec->get_Path(&path)) && path) status.executable.assign(path, SysStringLen(path));
+                    if (SUCCEEDED(exec->get_Arguments(&arguments)) && arguments) status.arguments.assign(arguments, SysStringLen(arguments));
+                    if (path) SysFreeString(path);
+                    if (arguments) SysFreeString(arguments);
+                }
+            }
+        }
+    }
+    return S_OK;
 }
 
 inline HRESULT DeleteDailyShutdownTask() {

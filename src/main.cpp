@@ -149,6 +149,8 @@ bool g_showWindow = false;
 bool g_dailyShutdownTrigger = false;
 bool g_dailyShutdownEnabled = false;
 std::vector<WORD> g_dailyShutdownTimes;
+liberty::DailyShutdownTaskStatus g_dailyTaskStatus;
+HRESULT g_dailyTaskQueryResult = S_OK;
 
 const wchar_t* T(const wchar_t* english, const wchar_t* chinese) {
     return g_chinese ? chinese : english;
@@ -190,25 +192,53 @@ void SaveDword(const wchar_t* name, DWORD value) {
     RegCloseKey(key);
 }
 
+bool SaveDailyShutdownSettings(const std::vector<WORD>& times, bool enabled);
+
 void LoadDailyShutdownSettings() {
     g_dailyShutdownEnabled = false;
     g_dailyShutdownTimes.clear();
     HKEY key = nullptr;
-    if (RegOpenKeyExW(HKEY_CURRENT_USER, kRegistryKey, 0, KEY_QUERY_VALUE, &key) != ERROR_SUCCESS) return;
-    DWORD type = 0, bytes = 0;
-    if (RegQueryValueExW(key, L"DailyShutdownTimes", nullptr, &type, nullptr, &bytes) == ERROR_SUCCESS &&
-        type == REG_BINARY && bytes > 0 && bytes % sizeof(WORD) == 0 &&
-        bytes <= liberty::kMaxDailyShutdownTimes * sizeof(WORD)) {
-        g_dailyShutdownTimes.resize(bytes / sizeof(WORD));
-        if (RegQueryValueExW(key, L"DailyShutdownTimes", nullptr, &type,
-            reinterpret_cast<BYTE*>(g_dailyShutdownTimes.data()), &bytes) != ERROR_SUCCESS ||
-            !liberty::NormalizeDailyShutdownTimes(g_dailyShutdownTimes)) g_dailyShutdownTimes.clear();
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, kRegistryKey, 0, KEY_QUERY_VALUE, &key) == ERROR_SUCCESS) {
+        DWORD type = 0, bytes = 0;
+        if (RegQueryValueExW(key, L"DailyShutdownTimes", nullptr, &type, nullptr, &bytes) == ERROR_SUCCESS &&
+            type == REG_BINARY && bytes > 0 && bytes % sizeof(WORD) == 0 &&
+            bytes <= liberty::kMaxDailyShutdownTimes * sizeof(WORD)) {
+            g_dailyShutdownTimes.resize(bytes / sizeof(WORD));
+            if (RegQueryValueExW(key, L"DailyShutdownTimes", nullptr, &type,
+                reinterpret_cast<BYTE*>(g_dailyShutdownTimes.data()), &bytes) != ERROR_SUCCESS ||
+                !liberty::NormalizeDailyShutdownTimes(g_dailyShutdownTimes)) g_dailyShutdownTimes.clear();
+        }
+        DWORD enabled = 0, enabledBytes = sizeof(enabled);
+        if (RegQueryValueExW(key, L"DailyShutdownEnabled", nullptr, &type,
+            reinterpret_cast<BYTE*>(&enabled), &enabledBytes) == ERROR_SUCCESS && type == REG_DWORD)
+            g_dailyShutdownEnabled = enabled != 0 && !g_dailyShutdownTimes.empty();
+        RegCloseKey(key);
     }
-    DWORD enabled = 0, enabledBytes = sizeof(enabled);
-    if (RegQueryValueExW(key, L"DailyShutdownEnabled", nullptr, &type,
-        reinterpret_cast<BYTE*>(&enabled), &enabledBytes) == ERROR_SUCCESS && type == REG_DWORD)
-        g_dailyShutdownEnabled = enabled != 0 && !g_dailyShutdownTimes.empty();
-    RegCloseKey(key);
+#ifdef LIBERTY_TESTING
+    g_dailyTaskStatus = {};
+    g_dailyTaskStatus.exists = g_dailyShutdownEnabled;
+    g_dailyTaskStatus.enabled = g_dailyShutdownEnabled;
+    g_dailyTaskStatus.times = g_dailyShutdownTimes;
+    g_dailyTaskQueryResult = S_OK;
+#else
+    liberty::DailyShutdownTaskStatus actual;
+    g_dailyTaskQueryResult = liberty::QueryDailyShutdownTask(actual);
+    if (SUCCEEDED(g_dailyTaskQueryResult)) {
+        g_dailyTaskStatus = actual;
+        if (actual.exists && !actual.times.empty()) {
+            // Windows Task Scheduler is the source of truth. Repair stale/missing app state.
+            g_dailyShutdownTimes = actual.times;
+            g_dailyShutdownEnabled = actual.enabled;
+            SaveDailyShutdownSettings(g_dailyShutdownTimes, g_dailyShutdownEnabled);
+        } else if (actual.exists) {
+            g_dailyShutdownEnabled = false;
+            SaveDailyShutdownSettings(g_dailyShutdownTimes, false);
+        } else if (!actual.exists && g_dailyShutdownEnabled) {
+            g_dailyShutdownEnabled = false;
+            SaveDailyShutdownSettings(g_dailyShutdownTimes, false);
+        }
+    }
+#endif
 }
 
 bool SaveDailyShutdownSettings(const std::vector<WORD>& times, bool enabled) {
@@ -686,7 +716,7 @@ void OpenCacheCleanup() {
 
 void ShowAbout() {
     MessageBoxW(g_menuWindow ? g_menuWindow : g_window,
-                T(L"Liberty by Bada 0.1.4\n\nA small Windows control panel.", L"Liberty by Bada 0.1.4\n\n一个简约的 Windows 控制面板。"),
+                T(L"Liberty by Bada 0.1.5\n\nA small Windows control panel.", L"Liberty by Bada 0.1.5\n\n一个简约的 Windows 控制面板。"),
                 kAppName, MB_OK | MB_ICONINFORMATION);
 }
 
@@ -717,11 +747,35 @@ void PopulateDailyShutdownList(HWND window, const std::vector<WORD>& values) {
     const HWND list = GetDlgItem(window, IDC_SHUTDOWN_DAILY_LIST);
     SendMessageW(list, LB_RESETCONTENT, 0, 0);
     for (WORD value : values) {
-        const std::wstring label = liberty::DailyShutdownTimeLabel(value);
+        SYSTEMTIME now{}, next{};
+        GetLocalTime(&now);
+        next = now;
+        next.wHour = value / 60;
+        next.wMinute = value % 60;
+        next.wSecond = 0;
+        next.wMilliseconds = 0;
+        FILETIME nowFile{}, nextFile{};
+        SystemTimeToFileTime(&now, &nowFile);
+        SystemTimeToFileTime(&next, &nextFile);
+        const ULONGLONG nowTicks = (static_cast<ULONGLONG>(nowFile.dwHighDateTime) << 32) | nowFile.dwLowDateTime;
+        ULONGLONG nextTicks = (static_cast<ULONGLONG>(nextFile.dwHighDateTime) << 32) | nextFile.dwLowDateTime;
+        if (nextTicks <= nowTicks) nextTicks += 24ULL * 60 * 60 * liberty::kFileTimeSecond;
+        nextFile.dwLowDateTime = static_cast<DWORD>(nextTicks);
+        nextFile.dwHighDateTime = static_cast<DWORD>(nextTicks >> 32);
+        FileTimeToSystemTime(&nextFile, &next);
+        const bool inSystemTask = std::find(g_dailyTaskStatus.times.begin(), g_dailyTaskStatus.times.end(), value) !=
+            g_dailyTaskStatus.times.end();
+        const wchar_t* state = inSystemTask && g_dailyTaskStatus.enabled ? T(L"enabled", L"已启用") :
+            inSystemTask ? T(L"disabled", L"已停用") : T(L"saved", L"已保存");
+        wchar_t nextText[32]{};
+        swprintf_s(nextText, L"%02u-%02u %02u:%02u", next.wMonth, next.wDay, next.wHour, next.wMinute);
+        std::wstring label = liberty::DailyShutdownTimeLabel(value) + L"    " + state +
+            T(L" · daily · next ", L" · 每天 · 下次 ") + nextText;
         const LRESULT index = SendMessageW(list, LB_ADDSTRING, 0, reinterpret_cast<LPARAM>(label.c_str()));
         if (index >= 0) SendMessageW(list, LB_SETITEMDATA, static_cast<WPARAM>(index), value);
     }
     EnableWindow(GetDlgItem(window, IDC_SHUTDOWN_DAILY_REMOVE), false);
+    EnableWindow(GetDlgItem(window, IDC_SHUTDOWN_DAILY_EDIT), false);
 }
 
 std::vector<WORD> ReadDailyShutdownList(HWND window) {
@@ -736,13 +790,19 @@ std::vector<WORD> ReadDailyShutdownList(HWND window) {
     return values;
 }
 
-std::wstring DailyShutdownSummary(const std::vector<WORD>& values) {
-    std::wstring summary;
-    for (WORD value : values) {
-        if (!summary.empty()) summary += L"、";
-        summary += liberty::DailyShutdownTimeLabel(value);
-    }
-    return summary;
+std::wstring ScheduledTaskDate(DATE value) {
+    SYSTEMTIME time{};
+    if (value <= 0 || !VariantTimeToSystemTime(value, &time)) return T(L"unavailable", L"不可用");
+    wchar_t buffer[40]{};
+    swprintf_s(buffer, L"%04u-%02u-%02u %02u:%02u", time.wYear, time.wMonth, time.wDay, time.wHour, time.wMinute);
+    return buffer;
+}
+
+bool DailyTaskUsesCurrentExecutable() {
+    if (!g_dailyTaskStatus.exists) return false;
+    const std::wstring current = ModulePath();
+    return !current.empty() && _wcsicmp(g_dailyTaskStatus.executable.c_str(), current.c_str()) == 0 &&
+        Lower(g_dailyTaskStatus.arguments).find(L"--daily-shutdown") != std::wstring::npos;
 }
 
 void ShowShutdownMode(HWND window) {
@@ -750,49 +810,74 @@ void ShowShutdownMode(HWND window) {
     for (int id : {IDC_SHUTDOWN_PRESET_LABEL, IDC_SHUTDOWN_PRESET, IDC_SHUTDOWN_LABEL, IDC_SHUTDOWN_MINUTES})
         ShowWindow(GetDlgItem(window, id), daily ? SW_HIDE : SW_SHOW);
     for (int id : {IDC_SHUTDOWN_TIME_LABEL, IDC_SHUTDOWN_TIME, IDC_SHUTDOWN_DAILY_LIST,
-        IDC_SHUTDOWN_DAILY_ADD, IDC_SHUTDOWN_DAILY_REMOVE})
+        IDC_SHUTDOWN_DAILY_ADD, IDC_SHUTDOWN_DAILY_EDIT, IDC_SHUTDOWN_DAILY_REMOVE,
+        IDC_SHUTDOWN_DAILY_REFRESH})
         ShowWindow(GetDlgItem(window, id), daily ? SW_SHOW : SW_HIDE);
     SetDlgItemTextW(window, IDC_SHUTDOWN_START,
-        daily ? T(L"Save schedule", L"保存计划") : T(L"Start timer", L"开始计时"));
+        daily ? T(L"Enable / repair", L"启用／修复") : T(L"Start timer", L"开始计时"));
     SetDlgItemTextW(window, IDC_SHUTDOWN_CANCEL,
-        daily ? T(L"Disable schedule", L"停用计划") : T(L"Cancel timer", L"取消关机"));
+        daily ? T(L"Disable all", L"停用全部") : T(L"Cancel timer", L"取消关机"));
     SetDlgItemTextW(window, IDC_SHUTDOWN_HINT, daily ? T(
-        L"Every listed time repeats daily, including after Liberty or Windows restarts. At that time Windows starts a 60-second shutdown countdown. The PC must be on, signed in and awake.",
-        L"列表内的时间每天重复，关闭 Liberty 或重启 Windows 后仍有效。到点后 Windows 启动 60 秒关机倒计时；电脑需处于开机、登录且未休眠状态。") : T(
+        L"This list is read from Windows Task Scheduler. Add, edit and remove apply immediately. Refresh imports external changes. Each time repeats daily and starts a 60-second countdown.",
+        L"列表直接读取 Windows 任务计划。添加、修改和删除会立即生效；“刷新”可导入外部更改。每个时间每天重复，到点启动 60 秒倒计时。") : T(
         L"Starts one Windows countdown. It remains active after closing Liberty. Unsaved applications may prevent shutdown.",
         L"启动一次 Windows 关机倒计时。关闭 Liberty 后倒计时仍有效，未保存的工作可能阻止关机。"));
 }
 
 void RefreshShutdownDialog(HWND window) {
     const bool active = g_shutdown.Active();
+    const bool daily = ShutdownUsesDailySchedule(window);
     std::wstring status = T(L"No shutdown scheduled.", L"尚未设置定时关机。");
-    if (active) {
+    if (daily) {
+        if (FAILED(g_dailyTaskQueryResult)) {
+            wchar_t code[24]{};
+            swprintf_s(code, L"0x%08lX", static_cast<unsigned long>(g_dailyTaskQueryResult));
+            status = T(L"Could not read Windows Task Scheduler: ", L"无法读取 Windows 任务计划：") + std::wstring(code);
+        } else if (g_dailyTaskStatus.exists && g_dailyTaskStatus.times.empty()) {
+            status = T(L"The Windows task contains no readable daily plans.\nClick Enable / repair to rebuild it.",
+                L"Windows 任务中没有可读取的每日计划。\n点击“启用／修复”重新创建。");
+        } else if (g_dailyTaskStatus.exists) {
+            status = g_dailyTaskStatus.enabled ? T(L"Windows task enabled", L"Windows 计划已启用") :
+                T(L"Windows task disabled", L"Windows 计划已停用");
+            status += T(L" · plans: ", L" · 计划数：") + std::to_wstring(g_dailyTaskStatus.times.size());
+            status += T(L"\nNext run: ", L"\n下次执行：") + ScheduledTaskDate(g_dailyTaskStatus.nextRun);
+            if (!DailyTaskUsesCurrentExecutable())
+                status += T(L" · path needs repair", L" · 程序路径需修复");
+        } else if (!g_dailyShutdownTimes.empty()) {
+            status = T(L"Schedule disabled · saved plans: ", L"计划已停用 · 已保存：") +
+                std::to_wstring(g_dailyShutdownTimes.size());
+            status += T(L"\nClick Enable / repair to create the Windows task.", L" 条\n点击“启用／修复”创建 Windows 任务。");
+        } else {
+            status = T(L"No daily shutdown plans. Choose a time and click Add.",
+                L"没有每日关机计划。选择时间后点击“添加”。");
+        }
+        if (active) {
+            const ULONGLONG seconds = g_shutdown.SecondsRemaining();
+            wchar_t countdown[80]{};
+            swprintf_s(countdown, T(L" · one-time %llu:%02llu:%02llu", L" · 临时倒计时 %llu:%02llu:%02llu"),
+                seconds / 3600, seconds / 60 % 60, seconds % 60);
+            status += countdown;
+        }
+    } else if (active) {
         const ULONGLONG seconds = g_shutdown.SecondsRemaining();
         wchar_t buffer[160]{};
         if (seconds) swprintf_s(buffer, T(L"Shutdown in %llu:%02llu:%02llu", L"距离关机还有 %llu:%02llu:%02llu"),
             seconds / 3600, seconds / 60 % 60, seconds % 60);
         else swprintf_s(buffer, L"%s", T(L"Shutdown requested. Unsaved work may need attention.", L"已请求关机；未保存的工作可能需要处理。"));
         status = buffer;
-    } else if (ShutdownUsesDailySchedule(window)) {
-        const std::vector<WORD> values = ReadDailyShutdownList(window);
-        if (values.empty())
-            status = T(L"Add one or more times, then save the daily schedule.", L"请添加一个或多个时间，再保存每日计划。");
-        else if (g_dailyShutdownEnabled && values == g_dailyShutdownTimes)
-            status = T(L"Daily schedule enabled: ", L"每日计划已启用：") + DailyShutdownSummary(values);
-        else
-            status = T(L"Ready to save daily: ", L"待保存的每日时间：") + DailyShutdownSummary(values);
     }
     SetDlgItemTextW(window, IDC_SHUTDOWN_STATUS, status.c_str());
-    const bool daily = ShutdownUsesDailySchedule(window);
     const bool hasDailyTimes = !ReadDailyShutdownList(window).empty();
-    const bool canSaveDaily = hasDailyTimes || !g_dailyShutdownTimes.empty() || g_dailyShutdownEnabled;
-    EnableWindow(GetDlgItem(window, IDC_SHUTDOWN_START), !active && (!daily || canSaveDaily));
-    EnableWindow(GetDlgItem(window, IDC_SHUTDOWN_CANCEL), active || (daily && g_dailyShutdownEnabled));
-    for (int id : {IDC_SHUTDOWN_DURATION_MODE, IDC_SHUTDOWN_TIME_MODE, IDC_SHUTDOWN_PRESET,
-        IDC_SHUTDOWN_MINUTES, IDC_SHUTDOWN_TIME, IDC_SHUTDOWN_DAILY_LIST, IDC_SHUTDOWN_DAILY_ADD})
-        EnableWindow(GetDlgItem(window, id), !active);
+    EnableWindow(GetDlgItem(window, IDC_SHUTDOWN_START), daily ? hasDailyTimes : !active);
+    EnableWindow(GetDlgItem(window, IDC_SHUTDOWN_CANCEL), daily ? g_dailyTaskStatus.exists : active);
+    EnableWindow(GetDlgItem(window, IDC_SHUTDOWN_DURATION_MODE), TRUE);
+    EnableWindow(GetDlgItem(window, IDC_SHUTDOWN_TIME_MODE), TRUE);
+    for (int id : {IDC_SHUTDOWN_PRESET, IDC_SHUTDOWN_MINUTES}) EnableWindow(GetDlgItem(window, id), !active);
+    for (int id : {IDC_SHUTDOWN_TIME, IDC_SHUTDOWN_DAILY_LIST, IDC_SHUTDOWN_DAILY_ADD,
+        IDC_SHUTDOWN_DAILY_REFRESH}) EnableWindow(GetDlgItem(window, id), daily);
     const LRESULT selection = SendDlgItemMessageW(window, IDC_SHUTDOWN_DAILY_LIST, LB_GETCURSEL, 0, 0);
-    EnableWindow(GetDlgItem(window, IDC_SHUTDOWN_DAILY_REMOVE), !active && daily && selection != LB_ERR);
+    EnableWindow(GetDlgItem(window, IDC_SHUTDOWN_DAILY_EDIT), daily && selection != LB_ERR);
+    EnableWindow(GetDlgItem(window, IDC_SHUTDOWN_DAILY_REMOVE), daily && selection != LB_ERR);
 }
 
 void DailyShutdownTaskError(HWND window, HRESULT error) {
@@ -805,6 +890,56 @@ void DailyShutdownTaskError(HWND window, HRESULT error) {
     swprintf_s(code, L" (0x%08lX)", static_cast<unsigned long>(error));
     message += code;
     MessageBoxW(window, message.c_str(), kAppName, MB_OK | MB_ICONERROR);
+}
+
+void ReloadDailyShutdownPlans(HWND window, WORD preferred = 0xffff) {
+    LoadDailyShutdownSettings();
+    PopulateDailyShutdownList(window, g_dailyShutdownTimes);
+    if (preferred < 24 * 60) {
+        for (size_t index = 0; index < g_dailyShutdownTimes.size(); ++index) {
+            if (g_dailyShutdownTimes[index] == preferred) {
+                SendDlgItemMessageW(window, IDC_SHUTDOWN_DAILY_LIST, LB_SETCURSEL, index, 0);
+                break;
+            }
+        }
+    }
+    RefreshShutdownDialog(window);
+}
+
+bool ApplyDailyShutdownPlans(HWND window, std::vector<WORD> values, bool enabled, WORD preferred = 0xffff) {
+    if (!values.empty() && !liberty::NormalizeDailyShutdownTimes(values)) {
+        MessageBoxW(window, T(L"The daily shutdown plan is invalid.", L"每日关机计划无效。"),
+            kAppName, MB_OK | MB_ICONWARNING);
+        return false;
+    }
+    if (values.empty()) enabled = false;
+    const std::vector<WORD> previousTimes = g_dailyShutdownTimes;
+    const bool previousEnabled = g_dailyShutdownEnabled;
+    HRESULT result = S_OK;
+#ifndef LIBERTY_TESTING
+    result = enabled ? liberty::ApplyDailyShutdownTask(values, ModulePath()) : liberty::DeleteDailyShutdownTask();
+#else
+    (void)previousTimes;
+    (void)previousEnabled;
+#endif
+    if (FAILED(result)) {
+        DailyShutdownTaskError(window, result);
+        return false;
+    }
+    if (!SaveDailyShutdownSettings(values, enabled)) {
+#ifndef LIBERTY_TESTING
+        if (previousEnabled && !previousTimes.empty()) liberty::ApplyDailyShutdownTask(previousTimes, ModulePath());
+        else liberty::DeleteDailyShutdownTask();
+#endif
+        MessageBoxW(window, T(L"The plan could not be saved; the previous Windows task was restored.",
+            L"未能保存计划，已恢复之前的 Windows 任务。"), kAppName, MB_OK | MB_ICONERROR);
+        return false;
+    }
+    g_dailyShutdownTimes = std::move(values);
+    g_dailyShutdownEnabled = enabled;
+    SaveDword(L"ShutdownDailyMode", 1);
+    ReloadDailyShutdownPlans(window, preferred);
+    return true;
 }
 
 void ShutdownError(HWND window, DWORD error) {
@@ -836,7 +971,9 @@ INT_PTR CALLBACK ShutdownProc(HWND window, UINT message, WPARAM wParam, LPARAM l
         SetDlgItemTextW(window, IDC_SHUTDOWN_TIME_MODE, T(L"Daily schedule", L"每日定时关机"));
         SetDlgItemTextW(window, IDC_SHUTDOWN_TIME_LABEL, T(L"Time (24-hour)", L"时间（24 小时制）"));
         SetDlgItemTextW(window, IDC_SHUTDOWN_DAILY_ADD, T(L"Add", L"添加"));
+        SetDlgItemTextW(window, IDC_SHUTDOWN_DAILY_EDIT, T(L"Edit", L"修改"));
         SetDlgItemTextW(window, IDC_SHUTDOWN_DAILY_REMOVE, T(L"Remove", L"删除"));
+        SetDlgItemTextW(window, IDC_SHUTDOWN_DAILY_REFRESH, T(L"Refresh", L"刷新"));
         SetDlgItemTextW(window, IDC_SHUTDOWN_PRESET_LABEL, T(L"Duration", L"常用时长"));
         SetDlgItemTextW(window, IDC_SHUTDOWN_LABEL, T(L"Minutes (1-10080)", L"分钟（1–10080）"));
         SetDlgItemTextW(window, IDC_SHUTDOWN_START, T(L"Start timer", L"开始计时"));
@@ -887,31 +1024,70 @@ INT_PTR CALLBACK ShutdownProc(HWND window, UINT message, WPARAM wParam, LPARAM l
             return TRUE;
         }
         if (LOWORD(wParam) == IDC_SHUTDOWN_DAILY_LIST && HIWORD(wParam) == LBN_SELCHANGE) {
+            const LRESULT selected = SendDlgItemMessageW(window, IDC_SHUTDOWN_DAILY_LIST, LB_GETCURSEL, 0, 0);
+            if (selected != LB_ERR) {
+                const LRESULT value = SendDlgItemMessageW(window, IDC_SHUTDOWN_DAILY_LIST, LB_GETITEMDATA,
+                    static_cast<WPARAM>(selected), 0);
+                if (value >= 0 && value < 24 * 60) {
+                    SYSTEMTIME time{};
+                    GetLocalTime(&time);
+                    time.wHour = static_cast<WORD>(value / 60);
+                    time.wMinute = static_cast<WORD>(value % 60);
+                    time.wSecond = 0;
+                    time.wMilliseconds = 0;
+                    SendDlgItemMessageW(window, IDC_SHUTDOWN_TIME, DTM_SETSYSTEMTIME, GDT_VALID,
+                        reinterpret_cast<LPARAM>(&time));
+                }
+            }
             RefreshShutdownDialog(window);
+            EnableWindow(GetDlgItem(window, IDC_SHUTDOWN_DAILY_EDIT), selected != LB_ERR);
+            EnableWindow(GetDlgItem(window, IDC_SHUTDOWN_DAILY_REMOVE), selected != LB_ERR);
             return TRUE;
         }
         if (LOWORD(wParam) == IDC_SHUTDOWN_DAILY_ADD) {
             WORD value = 0;
             std::vector<WORD> values = ReadDailyShutdownList(window);
             if (!ReadShutdownDailyTime(window, value)) return TRUE;
+            const auto existing = std::find(values.begin(), values.end(), value);
+            if (existing != values.end()) {
+                SendDlgItemMessageW(window, IDC_SHUTDOWN_DAILY_LIST, LB_SETCURSEL,
+                    static_cast<WPARAM>(std::distance(values.begin(), existing)), 0);
+                RefreshShutdownDialog(window);
+                SetDlgItemTextW(window, IDC_SHUTDOWN_STATUS,
+                    T(L"That daily plan already exists.", L"该每日关机计划已经存在。"));
+                return TRUE;
+            }
             values.push_back(value);
             if (!liberty::NormalizeDailyShutdownTimes(values) || values.size() > liberty::kMaxDailyShutdownTimes) {
                 MessageBoxW(window, T(L"You can save up to 24 different daily times.", L"每天最多可以保存 24 个不同的关机时间。"),
                     kAppName, MB_OK | MB_ICONWARNING);
                 return TRUE;
             }
-            PopulateDailyShutdownList(window, values);
-            const auto found = std::find(values.begin(), values.end(), value);
-            if (found != values.end()) SendDlgItemMessageW(window, IDC_SHUTDOWN_DAILY_LIST, LB_SETCURSEL,
-                static_cast<WPARAM>(std::distance(values.begin(), found)), 0);
-            RefreshShutdownDialog(window);
+            ApplyDailyShutdownPlans(window, values, true, value);
+            return TRUE;
+        }
+        if (LOWORD(wParam) == IDC_SHUTDOWN_DAILY_EDIT) {
+            const LRESULT selected = SendDlgItemMessageW(window, IDC_SHUTDOWN_DAILY_LIST, LB_GETCURSEL, 0, 0);
+            WORD replacement = 0;
+            std::vector<WORD> values = ReadDailyShutdownList(window);
+            if (selected == LB_ERR || static_cast<size_t>(selected) >= values.size() ||
+                !ReadShutdownDailyTime(window, replacement)) return TRUE;
+            values[static_cast<size_t>(selected)] = replacement;
+            liberty::NormalizeDailyShutdownTimes(values);
+            ApplyDailyShutdownPlans(window, values, g_dailyShutdownEnabled, replacement);
             return TRUE;
         }
         if (LOWORD(wParam) == IDC_SHUTDOWN_DAILY_REMOVE) {
             const LRESULT selected = SendDlgItemMessageW(window, IDC_SHUTDOWN_DAILY_LIST, LB_GETCURSEL, 0, 0);
-            if (selected != LB_ERR) SendDlgItemMessageW(window, IDC_SHUTDOWN_DAILY_LIST, LB_DELETESTRING,
-                static_cast<WPARAM>(selected), 0);
-            RefreshShutdownDialog(window);
+            std::vector<WORD> values = ReadDailyShutdownList(window);
+            if (selected != LB_ERR && static_cast<size_t>(selected) < values.size()) {
+                values.erase(values.begin() + selected);
+                ApplyDailyShutdownPlans(window, values, g_dailyShutdownEnabled && !values.empty());
+            }
+            return TRUE;
+        }
+        if (LOWORD(wParam) == IDC_SHUTDOWN_DAILY_REFRESH) {
+            ReloadDailyShutdownPlans(window);
             return TRUE;
         }
         if (LOWORD(wParam) == IDC_SHUTDOWN_PRESET && HIWORD(wParam) == CBN_SELCHANGE) {
@@ -940,41 +1116,12 @@ INT_PTR CALLBACK ShutdownProc(HWND window, UINT message, WPARAM wParam, LPARAM l
                     return TRUE;
                 }
                 std::vector<WORD> values = ReadDailyShutdownList(window);
-                const std::vector<WORD> previousTimes = g_dailyShutdownTimes;
-                const bool previousEnabled = g_dailyShutdownEnabled;
                 if (values.empty()) {
-                    const HRESULT result = liberty::DeleteDailyShutdownTask();
-                    if (FAILED(result)) DailyShutdownTaskError(window, result);
-                    else if (!SaveDailyShutdownSettings({}, false)) {
-                        if (previousEnabled) liberty::ApplyDailyShutdownTask(previousTimes, ModulePath());
-                        MessageBoxW(window, T(L"The saved daily times could not be cleared.", L"未能清除已保存的每日时间。"),
-                            kAppName, MB_OK | MB_ICONERROR);
-                    } else {
-                        g_dailyShutdownTimes.clear();
-                        g_dailyShutdownEnabled = false;
-                    }
-                    RefreshShutdownDialog(window);
+                    MessageBoxW(window, T(L"Add at least one daily time before enabling the plan.",
+                        L"请先添加至少一个每日关机时间。"), kAppName, MB_OK | MB_ICONWARNING);
                     return TRUE;
                 }
-                if (!liberty::NormalizeDailyShutdownTimes(values)) {
-                    MessageBoxW(window, T(L"The daily shutdown time list is invalid.", L"每日关机时间列表无效。"),
-                        kAppName, MB_OK | MB_ICONWARNING);
-                    return TRUE;
-                }
-                const HRESULT result = liberty::ApplyDailyShutdownTask(values, ModulePath());
-                if (FAILED(result)) DailyShutdownTaskError(window, result);
-                else if (!SaveDailyShutdownSettings(values, true)) {
-                    if (previousEnabled) liberty::ApplyDailyShutdownTask(previousTimes, ModulePath());
-                    else liberty::DeleteDailyShutdownTask();
-                    MessageBoxW(window, T(L"The daily task was not saved; the previous schedule was restored.",
-                        L"每日计划未能保存，已恢复之前的设置。"), kAppName, MB_OK | MB_ICONERROR);
-                } else {
-                    g_dailyShutdownTimes = values;
-                    g_dailyShutdownEnabled = true;
-                    SaveDword(L"ShutdownDailyMode", 1);
-                }
-                RefreshShutdownDialog(window);
-                if (g_dailyShutdownEnabled) SetFocus(GetDlgItem(window, IDC_SHUTDOWN_CANCEL));
+                if (ApplyDailyShutdownPlans(window, values, true)) SetFocus(GetDlgItem(window, IDC_SHUTDOWN_CANCEL));
                 return TRUE;
             }
             wchar_t text[32]{};
@@ -1000,20 +1147,10 @@ INT_PTR CALLBACK ShutdownProc(HWND window, UINT message, WPARAM wParam, LPARAM l
                 if (error) ShutdownError(window, error);
                 RefreshShutdownDialog(window);
                 if (!error) SetDlgItemTextW(window, IDC_SHUTDOWN_STATUS, T(L"Shutdown cancelled.", L"已取消定时关机。"));
-            } else if (ShutdownUsesDailySchedule(window) && g_dailyShutdownEnabled) {
+            } else if (ShutdownUsesDailySchedule(window) && g_dailyTaskStatus.exists) {
                 std::vector<WORD> values = ReadDailyShutdownList(window);
                 if (!values.empty()) liberty::NormalizeDailyShutdownTimes(values);
-                const HRESULT result = liberty::DeleteDailyShutdownTask();
-                if (FAILED(result)) DailyShutdownTaskError(window, result);
-                else if (!SaveDailyShutdownSettings(values, false)) {
-                    liberty::ApplyDailyShutdownTask(g_dailyShutdownTimes, ModulePath());
-                    MessageBoxW(window, T(L"The daily plan could not be disabled; the previous task was restored.",
-                        L"未能停用每日计划，已恢复之前的系统任务。"), kAppName, MB_OK | MB_ICONERROR);
-                }
-                else {
-                    g_dailyShutdownTimes = values;
-                    g_dailyShutdownEnabled = false;
-                    RefreshShutdownDialog(window);
+                if (ApplyDailyShutdownPlans(window, values, false)) {
                     SetDlgItemTextW(window, IDC_SHUTDOWN_STATUS, T(L"Daily shutdown schedule disabled. Saved times were kept.",
                         L"每日关机计划已停用；时间列表已保留。"));
                 }
@@ -1137,11 +1274,17 @@ void BuildMenuControls(HWND window) {
     ClearMenuControls(window);
     g_menuFont = CreateUiFont(window, 15, FW_NORMAL);
     const int dpi = static_cast<int>(GetDpiForWindow(window));
+    LoadDailyShutdownSettings();
     for (size_t index = 0; index < ARRAYSIZE(kMenuItems); ++index) {
         const MenuItem& item = kMenuItems[index];
         RECT row = MenuRowRect(window, static_cast<int>(index));
         const DWORD buttonStyle = item.toggle ? BS_AUTOCHECKBOX | BS_RIGHTBUTTON | BS_MULTILINE : BS_OWNERDRAW;
-        HWND checkbox = CreateWindowExW(0, L"BUTTON", T(item.english, item.chinese),
+        std::wstring caption = T(item.english, item.chinese);
+        if (item.id == ID_SHUTDOWN && !g_dailyShutdownTimes.empty()) {
+            caption += g_dailyShutdownEnabled ? T(L" · active ", L" · 已启用 ") : T(L" · disabled ", L" · 已停用 ");
+            caption += std::to_wstring(g_dailyShutdownTimes.size());
+        }
+        HWND checkbox = CreateWindowExW(0, L"BUTTON", caption.c_str(),
                                         WS_CHILD | WS_VISIBLE | WS_TABSTOP | buttonStyle,
                                         row.left + MulDiv(12, dpi, 96), row.top + MulDiv(3, dpi, 96),
                                         row.right - row.left - MulDiv(24, dpi, 96), row.bottom - row.top - MulDiv(6, dpi, 96),

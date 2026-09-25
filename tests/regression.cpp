@@ -15,6 +15,7 @@ int main() {
     Gdiplus::GdiplusStartup(&g_gdiplusToken, &gdip, nullptr);
     INITCOMMONCONTROLSEX controls{sizeof(controls), ICC_STANDARD_CLASSES | ICC_DATE_CLASSES};
     InitCommonControlsEx(&controls);
+    RegDeleteTreeW(HKEY_CURRENT_USER, kRegistryKey);
     int result = 0;
     try {
         DWORD minutes = 0;
@@ -32,6 +33,13 @@ int main() {
         boundaryDate.wYear = 2026; boundaryDate.wMonth = 9; boundaryDate.wDay = 16;
         Check(liberty::DailyShutdownBoundary(23 * 60 + 30, boundaryDate) == L"2026-09-16T23:30:00",
             "daily trigger starts at local calendar time");
+        WORD parsedBoundary = 0;
+        Check(liberty::ParseDailyShutdownBoundary(L"2026-09-16T01:15:00", parsedBoundary) && parsedBoundary == 75,
+            "task trigger boundary imports existing plan time");
+        Check(liberty::ParseDailyShutdownBoundary(L"2026-09-16T23:59:00+08:00", parsedBoundary) && parsedBoundary == 1439,
+            "task trigger boundary accepts explicit time-zone suffix");
+        Check(!liberty::ParseDailyShutdownBoundary(L"2026-09-16T24:00:00", parsedBoundary) &&
+            !liberty::ParseDailyShutdownBoundary(L"bad", parsedBoundary), "invalid task trigger boundary rejected");
         dailyTimes.assign(25, 1);
         for (WORD index = 0; index < dailyTimes.size(); ++index) dailyTimes[index] = index;
         Check(!liberty::NormalizeDailyShutdownTimes(dailyTimes), "daily schedule rejects more than 24 distinct times");
@@ -83,7 +91,8 @@ int main() {
         HWND shutdownDialog = CreateDialogParamW(g_instance, MAKEINTRESOURCEW(IDD_SHUTDOWN), nullptr, ShutdownProc, 0);
         Check(shutdownDialog != nullptr, "native daily shutdown dialog resource loads");
         Check(ShutdownUsesDailySchedule(shutdownDialog) && GetDlgItem(shutdownDialog, IDC_SHUTDOWN_DAILY_LIST) &&
-            GetDlgItem(shutdownDialog, IDC_SHUTDOWN_TIME), "daily mode and multi-time controls present");
+            GetDlgItem(shutdownDialog, IDC_SHUTDOWN_TIME) && GetDlgItem(shutdownDialog, IDC_SHUTDOWN_DAILY_EDIT) &&
+            GetDlgItem(shutdownDialog, IDC_SHUTDOWN_DAILY_REFRESH), "daily plan management controls present");
         WORD selectedMinute = 0;
         Check(ReadShutdownDailyTime(shutdownDialog, selectedMinute) && selectedMinute < 24 * 60,
             "native daily time resolves to a valid minute");
@@ -97,6 +106,26 @@ int main() {
         SendMessageW(shutdownDialog, WM_COMMAND, MAKEWPARAM(IDC_SHUTDOWN_DAILY_ADD, BN_CLICKED), 0);
         Check(ReadDailyShutdownList(shutdownDialog) == std::vector<WORD>({8 * 60 + 5, 23 * 60 + 30}),
             "daily dialog keeps several sorted unique times");
+        Check(g_dailyShutdownEnabled && g_dailyShutdownTimes == std::vector<WORD>({8 * 60 + 5, 23 * 60 + 30}),
+            "adding a plan applies and persists immediately");
+        SendDlgItemMessageW(shutdownDialog, IDC_SHUTDOWN_DAILY_LIST, LB_SETCURSEL, 0, 0);
+        firstDaily.wHour = 9; firstDaily.wMinute = 10;
+        SendDlgItemMessageW(shutdownDialog, IDC_SHUTDOWN_TIME, DTM_SETSYSTEMTIME, GDT_VALID, reinterpret_cast<LPARAM>(&firstDaily));
+        SendMessageW(shutdownDialog, WM_COMMAND, MAKEWPARAM(IDC_SHUTDOWN_DAILY_EDIT, BN_CLICKED), 0);
+        Check(ReadDailyShutdownList(shutdownDialog) == std::vector<WORD>({9 * 60 + 10, 23 * 60 + 30}),
+            "selected daily plan can be edited");
+        SendDlgItemMessageW(shutdownDialog, IDC_SHUTDOWN_DAILY_LIST, LB_SETCURSEL, 1, 0);
+        SendMessageW(shutdownDialog, WM_COMMAND, MAKEWPARAM(IDC_SHUTDOWN_DAILY_REMOVE, BN_CLICKED), 0);
+        Check(ReadDailyShutdownList(shutdownDialog) == std::vector<WORD>({9 * 60 + 10}),
+            "selected daily plan can be removed immediately");
+        SendMessageW(shutdownDialog, WM_COMMAND, MAKEWPARAM(IDC_SHUTDOWN_DAILY_REFRESH, BN_CLICKED), 0);
+        Check(ReadDailyShutdownList(shutdownDialog) == std::vector<WORD>({9 * 60 + 10}),
+            "refresh restores persisted plan list");
+        SendMessageW(shutdownDialog, WM_COMMAND, MAKEWPARAM(IDC_SHUTDOWN_CANCEL, BN_CLICKED), 0);
+        Check(!g_dailyShutdownEnabled && ReadDailyShutdownList(shutdownDialog) == std::vector<WORD>({9 * 60 + 10}),
+            "disable all retains visible saved plans");
+        SendMessageW(shutdownDialog, WM_COMMAND, MAKEWPARAM(IDC_SHUTDOWN_START, BN_CLICKED), 0);
+        Check(g_dailyShutdownEnabled, "enable all restores saved plans");
         SendMessageW(GetDlgItem(shutdownDialog, IDC_SHUTDOWN_DURATION_MODE), BM_CLICK, 0, 0);
         Check(!ShutdownUsesDailySchedule(shutdownDialog) && (GetWindowLongPtrW(GetDlgItem(shutdownDialog, IDC_SHUTDOWN_MINUTES), GWL_STYLE) & WS_VISIBLE) &&
             !(GetWindowLongPtrW(GetDlgItem(shutdownDialog, IDC_SHUTDOWN_DAILY_LIST), GWL_STYLE) & WS_VISIBLE), "mode switch displays duration inputs only");

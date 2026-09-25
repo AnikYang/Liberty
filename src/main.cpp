@@ -54,6 +54,7 @@ constexpr wchar_t kRunKey[] = L"Software\\Microsoft\\Windows\\CurrentVersion\\Ru
 constexpr UINT kTrayMessage = WM_APP + 1;
 constexpr UINT kShowMenuMessage = WM_APP + 2;
 constexpr UINT kDailyShutdownMessage = WM_APP + 3;
+constexpr UINT kCloseMenuMessage = WM_APP + 4;
 constexpr ULONG_PTR kInjectedMarker = 0x4C494245525459ULL;
 
 enum Command : UINT {
@@ -144,6 +145,7 @@ WORD g_commandKey = VK_LWIN;
 WORD g_altKey = VK_LMENU;
 WORD g_controlKey = VK_LCONTROL;
 int g_menuHover = -1;
+bool g_menuAutoCloseArmed = false;
 DWORD g_lastClipboardSequence = 0;
 bool g_showWindow = false;
 bool g_dailyShutdownTrigger = false;
@@ -716,7 +718,7 @@ void OpenCacheCleanup() {
 
 void ShowAbout() {
     MessageBoxW(g_menuWindow ? g_menuWindow : g_window,
-                T(L"Liberty by Bada 0.1.5\n\nA small Windows control panel.", L"Liberty by Bada 0.1.5\n\n一个简约的 Windows 控制面板。"),
+                T(L"Liberty by Bada 0.1.6\n\nA small Windows control panel.", L"Liberty by Bada 0.1.6\n\n一个简约的 Windows 控制面板。"),
                 kAppName, MB_OK | MB_ICONINFORMATION);
 }
 
@@ -1307,6 +1309,7 @@ LRESULT CALLBACK MenuProc(HWND window, UINT message, WPARAM wParam, LPARAM lPara
         g_menuWindow = window;
         return DefWindowProcW(window, message, wParam, lParam);
     case WM_CREATE:
+        g_menuAutoCloseArmed = false;
         SetRoundedWindow(window);
         BuildMenuControls(window);
         return 0;
@@ -1447,7 +1450,7 @@ LRESULT CALLBACK MenuProc(HWND window, UINT message, WPARAM wParam, LPARAM lPara
     case WM_LBUTTONUP: {
         POINT point{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
         RECT footer = MenuFooterRect(window);
-        if (PtInRect(&footer, point)) { ShowAbout(); return 0; }
+        if (PtInRect(&footer, point)) { DestroyWindow(window); ShowAbout(); return 0; }
         for (size_t index = 0; index < ARRAYSIZE(kMenuItems); ++index) {
             RECT row = MenuRowRect(window, static_cast<int>(index));
             if (!PtInRect(&row, point)) continue;
@@ -1471,6 +1474,11 @@ LRESULT CALLBACK MenuProc(HWND window, UINT message, WPARAM wParam, LPARAM lPara
         return 0;
     }
     case WM_ACTIVATE:
+        if (LOWORD(wParam) != WA_INACTIVE) g_menuAutoCloseArmed = true;
+        else if (g_menuAutoCloseArmed) PostMessageW(window, kCloseMenuMessage, 0, 0);
+        return 0;
+    case kCloseMenuMessage:
+        if (g_menuAutoCloseArmed && GetForegroundWindow() != window) DestroyWindow(window);
         return 0;
     case WM_CANCELMODE:
         DestroyWindow(window);
@@ -1478,7 +1486,10 @@ LRESULT CALLBACK MenuProc(HWND window, UINT message, WPARAM wParam, LPARAM lPara
     case WM_NCDESTROY:
         ClearMenuControls(window);
         if (GetCapture() == window) ReleaseCapture();
-        if (g_menuWindow == window) g_menuWindow = nullptr;
+        if (g_menuWindow == window) {
+            g_menuWindow = nullptr;
+            g_menuAutoCloseArmed = false;
+        }
         return DefWindowProcW(window, message, wParam, lParam);
     }
     return DefWindowProcW(window, message, wParam, lParam);
@@ -1619,6 +1630,7 @@ void ShowMenu(HWND owner) {
     SetForegroundWindow(g_menuWindow);
     SetFocus(g_menuWindow);
     UpdateWindow(g_menuWindow);
+    if (GetForegroundWindow() == g_menuWindow) g_menuAutoCloseArmed = true;
 }
 
 void StartDailyShutdownCountdown() {

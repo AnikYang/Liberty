@@ -135,6 +135,19 @@ int main() {
         DestroyWindow(shutdownDialog);
 
         Check(RegisterClasses(), "window classes registered");
+        HWND autoCloseMenu = CreateWindowExW(0, kMenuClass, kAppName, WS_POPUP | WS_CLIPCHILDREN,
+            0, 0, 470, 462, nullptr, nullptr, g_instance, nullptr);
+        Check(autoCloseMenu != nullptr && !g_menuAutoCloseArmed, "menu auto-close starts disarmed to prevent startup flash");
+        MSG closeMessage{};
+        SendMessageW(autoCloseMenu, WM_ACTIVATE, WA_INACTIVE, 0);
+        Check(!PeekMessageW(&closeMessage, autoCloseMenu, kCloseMenuMessage, kCloseMenuMessage, PM_REMOVE),
+            "initial inactive notification does not close menu");
+        SendMessageW(autoCloseMenu, WM_ACTIVATE, WA_ACTIVE, 0);
+        Check(g_menuAutoCloseArmed, "first activation arms menu auto-close");
+        SendMessageW(autoCloseMenu, WM_ACTIVATE, WA_INACTIVE, 0);
+        Check(PeekMessageW(&closeMessage, autoCloseMenu, kCloseMenuMessage, kCloseMenuMessage, PM_REMOVE),
+            "losing activation schedules menu close");
+        DestroyWindow(autoCloseMenu);
         const UINT ids[] = {ID_MAC_MAPPING, ID_SLEEP_WITH_DISPLAY, ID_PREVENT_SLEEP, ID_SAVE_SCREENSHOTS, ID_PREVENT_LOCK};
         for (int mask = 0; mask < 32; ++mask) {
             g_macMapping = (mask & 1) != 0;

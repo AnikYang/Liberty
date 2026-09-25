@@ -32,8 +32,8 @@ IDI_LIBERTY ICON "assets\\liberty-trinity.ico"
 CREATEPROCESS_MANIFEST_RESOURCE_ID RT_MANIFEST "app.manifest"
 
 VS_VERSION_INFO VERSIONINFO
- FILEVERSION 0,1,5,0
- PRODUCTVERSION 0,1,5,0
+ FILEVERSION 0,1,6,0
+ PRODUCTVERSION 0,1,6,0
  FILEFLAGSMASK 0x3fL
 #ifdef _DEBUG
  FILEFLAGS VS_FF_DEBUG
@@ -50,11 +50,11 @@ BEGIN
         BEGIN
             VALUE "CompanyName", "Bada"
             VALUE "FileDescription", "Liberty by Bada"
-            VALUE "FileVersion", "0.1.5"
+            VALUE "FileVersion", "0.1.6"
             VALUE "InternalName", "Liberty"
             VALUE "OriginalFilename", "Liberty.exe"
             VALUE "ProductName", "Liberty by Bada"
-            VALUE "ProductVersion", "0.1.5"
+            VALUE "ProductVersion", "0.1.6"
         END
     END
     BLOCK "VarFileInfo"

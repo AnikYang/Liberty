@@ -1,7 +1,7 @@
 # Liberty by Bada
 
 Liberty by Bada is a compact native C++/Win32 tray panel for Windows 10/11 x64.
-Version: **0.1.5**.
+Version: **0.1.6**.
 
 The whole product surface is the single control panel below. Features outside this panel have intentionally been removed.
 
@@ -26,6 +26,8 @@ The macOS shortcut layer supports common Cmd shortcuts through their Windows equ
 ## Design and safety
 
 The tray panel has eight left-aligned rows, native Windows checkbox controls, restrained dividers, and a fixed Liberty by Bada footer. Saved checkbox states are applied during window creation. The parent paint does not overwrite child controls, and the popup uses its own monitor's DPI.
+
+The tray popup closes automatically when another application or the desktop receives focus. Auto-close is armed only after the popup has successfully activated, preventing the earlier open-then-flash-away race. Settings and shutdown-plan windows are normal work windows and remain open while editing; Back, Close, or Esc dismisses them.
 
 Prevent automatic lock is off by default. While enabled, Liberty requests an awake system and, after 45 seconds of inactivity, submits a zero-distance mouse activity event. It checks the Windows session and input desktop first, never unlocks an already-locked session, and does not change lock, screen-saver, or organization policies. Manual locking, Dynamic Lock, and enforced organization restrictions are not overridden. The display can briefly wake when activity is submitted; if display-off mode is enabled Liberty requests display-off again.
 
@@ -83,4 +85,4 @@ Liberty by Bada 是一个单页 Windows 托盘控制面板。本版在草图的�
 
 “防止自动锁屏”默认关闭。开启后，在已解锁的会话中定期维持活动，不会移动指针。关闭该开关即停止维持。手动锁定、动态锁和组织强制策略仍然有效；不会修改 Windows 锁屏策略，也不会自动解锁。
 
-0.1.5 已用现有的 01:15、01:30 系统计划完成只读验收：主菜单显示数量，管理页显示实际启用状态和下一次执行，选中后开放修改/删除，刷新后保持一致。自动回归覆盖添加、修改、删除、停用、启用、刷新及任务触发器导入。测试未改动这两条真实计划。详情见 [本版测试记录](docs/testing-0.1.5.md)。
+0.1.6 修复托盘主菜单失去焦点后仍停留的问题。主菜单成功激活后，点击其他应用或桌面会自动收起；首次显示期间的无效失焦消息不会触发关闭，避免菜单一闪而过。设置和关机计划管理窗口不会因失焦丢失编辑内容。详情见 [本版测试记录](docs/testing-0.1.6.md)。
